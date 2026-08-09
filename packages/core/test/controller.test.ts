@@ -30,6 +30,27 @@ function submit(
   return result.taskId;
 }
 
+function submitToRepo(controller: TaskController, repositoryId: string): string {
+  const result = controller.handle({
+    id: Bun.randomUUIDv7(),
+    type: "task.submit",
+    actor: "voice",
+    expectedRevision: null,
+    payload: { ...spec, repositoryId },
+  });
+  if (result.status !== "accepted" || !result.taskId) throw new Error(`Submission to ${repositoryId} failed`);
+  return result.taskId;
+}
+
+const acceptingEvidenceValidator = {
+  validateEvidence: () => ({
+    valid: true,
+    implementationComplete: true,
+    verificationComplete: true,
+    explanation: "test evidence accepted",
+  }),
+};
+
 describe("TaskController", () => {
   test("runs one task and atomically starts the next queued task", () => {
     const store = new EventStore();
@@ -238,6 +259,114 @@ describe("TaskController", () => {
       expect(repoACompletion.status).toBe("accepted");
       expect(controller.snapshot().queue).toEqual([]);
       expect(controller.snapshot().activeTaskIds ?? []).toEqual([repoATaskTwo]);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("a later-queued task for a free repository starts without waiting for an earlier blocked queue entry", () => {
+    // Regression test for head-of-line blocking: with 4 slots full across
+    // repos A/B/D/E, A2 (repo A, already owned) and C1 (repo C, free) both
+    // queue -- A2 because its repo is busy, C1 purely because capacity is
+    // full. When B1 finishes, a slot opens. C1 has no repository conflict at
+    // all and must start; A2 must keep waiting on A1, not on queue position.
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store, acceptingEvidenceValidator);
+      const a1 = submitToRepo(controller, "repo_a");
+      const b1 = submitToRepo(controller, "repo_b");
+      const d1 = submitToRepo(controller, "repo_d");
+      const e1 = submitToRepo(controller, "repo_e");
+      expect(controller.snapshot().activeTaskIds ?? []).toHaveLength(4);
+
+      const a2 = submitToRepo(controller, "repo_a"); // blocked: repo_a busy (a1)
+      const c1 = submitToRepo(controller, "repo_c"); // blocked: capacity full
+      expect(controller.snapshot().queue).toEqual([a2, c1]);
+
+      const completion = controller.completeTask(Bun.randomUUIDv7(), b1, "done", []);
+      expect(completion.status).toBe("accepted");
+
+      const snapshot = controller.snapshot();
+      expect(snapshot.activeTaskIds ?? []).toContain(c1);
+      expect(snapshot.tasks.find((task) => task.id === c1)?.state).toBe("running");
+      // a2 is still blocked by a1, which never finished -- it must still be queued.
+      expect(snapshot.queue).toEqual([a2]);
+      expect(snapshot.tasks.find((task) => task.id === a2)?.state).toBe("queued");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("same-repository queue order is preserved even when a different repository is free to skip ahead", () => {
+    // A1 running; queue is A2, A3, B1 (B1 queued only because capacity is
+    // full in this setup). Two slots free up. B1 (different repo) may start
+    // immediately, but A3 must never start before A2 -- same-repository FIFO
+    // is not something capacity or a different repo's eligibility can break.
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store, acceptingEvidenceValidator);
+      const a1 = submitToRepo(controller, "repo_a");
+      const x1 = submitToRepo(controller, "repo_x");
+      const y1 = submitToRepo(controller, "repo_y");
+      const z1 = submitToRepo(controller, "repo_z");
+      expect(controller.snapshot().activeTaskIds ?? []).toHaveLength(4);
+
+      const a2 = submitToRepo(controller, "repo_a"); // blocked: repo_a busy
+      const a3 = submitToRepo(controller, "repo_a"); // blocked: repo_a busy, and behind a2
+      const b1 = submitToRepo(controller, "repo_b"); // blocked: capacity full (4/4)
+      expect(controller.snapshot().queue).toEqual([a2, a3, b1]);
+      void z1;
+
+      // Free two slots at once (x1 and y1 finish); a1/repo_a is still busy.
+      controller.completeTask(Bun.randomUUIDv7(), x1, "done", []);
+      controller.completeTask(Bun.randomUUIDv7(), y1, "done", []);
+
+      const snapshot = controller.snapshot();
+      expect(snapshot.tasks.find((task) => task.id === b1)?.state).toBe("running");
+      expect(snapshot.tasks.find((task) => task.id === a2)?.state).toBe("queued");
+      expect(snapshot.tasks.find((task) => task.id === a3)?.state).toBe("queued");
+      expect(snapshot.queue).toEqual([a2, a3]);
+
+      // Now repo_a frees up: a2 must start before a3 even gets a chance.
+      controller.completeTask(Bun.randomUUIDv7(), a1, "done", []);
+      const afterA1 = controller.snapshot();
+      expect(afterA1.tasks.find((task) => task.id === a2)?.state).toBe("running");
+      expect(afterA1.tasks.find((task) => task.id === a3)?.state).toBe("queued");
+      expect(afterA1.queue).toEqual([a3]);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("spare global capacity never lets a second same-repository task skip the FIFO queue", () => {
+    // 3 active of 4 slots (genuine slack -- b1/c1 only claim 2 repos, a1 a
+    // third), with a2 and a3 both queued behind a1 on repo_a. A single
+    // finish can only ever free one repository, so even though a spare
+    // global slot exists throughout, exactly one task (a2) starts -- never
+    // both, and never a3 ahead of a2.
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store, acceptingEvidenceValidator);
+      const a1 = submitToRepo(controller, "repo_a");
+      submitToRepo(controller, "repo_b");
+      submitToRepo(controller, "repo_c");
+      expect(controller.snapshot().activeTaskIds ?? []).toHaveLength(3);
+
+      // Both block on repo_a specifically, not on capacity -- one global
+      // slot is free the whole time.
+      const a2 = submitToRepo(controller, "repo_a");
+      const a3 = submitToRepo(controller, "repo_a");
+      expect(controller.snapshot().queue).toEqual([a2, a3]);
+      expect(controller.snapshot().activeTaskIds ?? []).toHaveLength(3);
+
+      controller.completeTask(Bun.randomUUIDv7(), a1, "done", []);
+
+      const snapshot = controller.snapshot();
+      expect(snapshot.tasks.find((task) => task.id === a2)?.state).toBe("running");
+      expect(snapshot.tasks.find((task) => task.id === a3)?.state).toBe("queued");
+      expect(snapshot.queue).toEqual([a3]);
+      // a1 left, a2 joined: still 3, never spiked to 4 -- one finish, one start.
+      expect(snapshot.activeTaskIds ?? []).toHaveLength(3);
     } finally {
       store.close();
     }

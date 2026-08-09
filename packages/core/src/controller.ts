@@ -856,30 +856,44 @@ export class TaskController {
   }
 
   /**
-   * `excludingTaskId` is the task whose termination/cancellation triggered this
-   * call: it still occupies `activeTaskIds` at this point (that event hasn't been
-   * applied yet — events are only applied after this whole command decision
-   * returns), so it must be discounted or it would appear to block its own
-   * repository from immediately handing off to the next queued task.
+   * Finds the first queued task that can start right now, skipping past
+   * queue entries blocked only by a repository conflict — a task stuck
+   * behind a same-repository predecessor must never hold up an unrelated
+   * repository's task that's otherwise ready (head-of-line blocking).
+   *
+   * `excludingTaskId` is the task whose termination/cancellation triggered
+   * this call: it still occupies `activeTaskIds` at this point (that event
+   * hasn't been applied yet — events are only applied after this whole
+   * command decision returns), so it must be discounted or it would appear
+   * to block its own repository from immediately handing off.
+   *
+   * Same-repository FIFO order is preserved without extra bookkeeping: a
+   * single call returns at most one event (finishing exactly one task frees
+   * exactly one global capacity slot, so at most one new task can start —
+   * see the "spare global capacity" regression test), and an earlier queued
+   * task for a given repository is always reached, and always blocks on
+   * that repository's occupancy, before a later one for the same
+   * repository is even considered.
    */
   #startNextEvent(correlationId: string, excludingTaskId?: string): NewDomainEvent<"task.started"> | null {
-    const nextTaskId = this.#state.queue[0];
-    if (!nextTaskId) return null;
     const otherActiveTaskIds = this.#state.activeTaskIds.filter((id) => id !== excludingTaskId);
     if (otherActiveTaskIds.length >= MAX_CONCURRENT_TASKS) return null;
-    const nextTask = this.#requiredTask(nextTaskId);
-    const repositoryBusy = otherActiveTaskIds.some(
-      (id) => this.#requiredTask(id).repositoryId === nextTask.repositoryId,
+    const occupiedRepositories = new Set(
+      otherActiveTaskIds.map((id) => this.#requiredTask(id).repositoryId),
     );
-    if (repositoryBusy) return null;
-    const runId = this.#createId();
-    return this.#event(
-      "task.started",
-      { runId, revision: nextTask.revision },
-      correlationId,
-      nextTask,
-      runId,
-    );
+    for (const taskId of this.#state.queue) {
+      const task = this.#requiredTask(taskId);
+      if (occupiedRepositories.has(task.repositoryId)) continue;
+      const runId = this.#createId();
+      return this.#event(
+        "task.started",
+        { runId, revision: task.revision },
+        correlationId,
+        task,
+        runId,
+      );
+    }
+    return null;
   }
 
   #requiredTask(taskId: string): TaskRecord {
