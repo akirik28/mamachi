@@ -91,6 +91,158 @@ describe("TaskController", () => {
     }
   });
 
+  test("starts a second task immediately when it targets a different repository", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const firstTaskId = submit(controller);
+      const secondTaskId = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.submit",
+        actor: "voice",
+        expectedRevision: null,
+        payload: { ...spec, repositoryId: "repo_beta" },
+      });
+      if (secondTaskId.status !== "accepted" || !secondTaskId.taskId) {
+        throw new Error("Second task submission failed");
+      }
+
+      const snapshot = controller.snapshot();
+      expect((snapshot.activeTaskIds ?? []).sort()).toEqual([firstTaskId, secondTaskId.taskId].sort());
+      expect(snapshot.queue).toEqual([]);
+      expect(snapshot.tasks.find((task) => task.id === firstTaskId)?.state).toBe("running");
+      expect(snapshot.tasks.find((task) => task.id === secondTaskId.taskId)?.state).toBe("running");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("queues a second task targeting the same repository as an already-active task", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const firstTaskId = submit(controller);
+      const secondTaskId = submit(controller);
+
+      const snapshot = controller.snapshot();
+      expect(snapshot.activeTaskIds ?? []).toEqual([firstTaskId]);
+      expect(snapshot.queue).toEqual([secondTaskId]);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("caps concurrent active tasks at MAX_CONCURRENT_TASKS even across distinct repositories", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const taskIds: string[] = [];
+      for (let index = 0; index < 5; index += 1) {
+        const result = controller.handle({
+          id: Bun.randomUUIDv7(),
+          type: "task.submit",
+          actor: "voice",
+          expectedRevision: null,
+          payload: { ...spec, repositoryId: `repo_${index}` },
+        });
+        if (result.status !== "accepted" || !result.taskId) throw new Error("Submission failed");
+        taskIds.push(result.taskId);
+      }
+
+      const snapshot = controller.snapshot();
+      expect(snapshot.activeTaskIds ?? []).toHaveLength(4);
+      expect(snapshot.queue).toEqual([taskIds[4]!]);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("legacy activeTaskId reports the oldest active task for unchanged consumers", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const firstTaskId = submit(controller);
+      controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.submit",
+        actor: "voice",
+        expectedRevision: null,
+        payload: { ...spec, repositoryId: "repo_beta" },
+      });
+
+      expect(controller.snapshot().activeTaskId).toBe(firstTaskId);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("recovers every active task after a restart, not just one", () => {
+    const store = new EventStore();
+    try {
+      let controller = new TaskController(store);
+      const firstTaskId = submit(controller);
+      controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.submit",
+        actor: "voice",
+        expectedRevision: null,
+        payload: { ...spec, repositoryId: "repo_beta" },
+      });
+      const secondTaskId = (controller.snapshot().activeTaskIds ?? []).find((id) => id !== firstTaskId)!;
+
+      // Simulate a restart: rebuild the controller from the same event log.
+      controller = new TaskController(store);
+      const recovery = controller.recoverAfterRestart(Bun.randomUUIDv7());
+      expect(recovery.status).toBe("accepted");
+
+      const snapshot = controller.snapshot();
+      expect(snapshot.tasks.find((task) => task.id === firstTaskId)?.state).toBe("paused");
+      expect(snapshot.tasks.find((task) => task.id === secondTaskId)?.state).toBe("paused");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("a queued task waits behind a same-repository task even once a different repository frees up", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store, {
+        validateEvidence: () => ({
+          valid: true,
+          implementationComplete: true,
+          verificationComplete: true,
+          explanation: "test evidence accepted",
+        }),
+      });
+      const repoATaskOne = submit(controller);
+      const repoATaskTwo = submit(controller); // queues, same repo as repoATaskOne
+      const repoBTask = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.submit",
+        actor: "voice",
+        expectedRevision: null,
+        payload: { ...spec, repositoryId: "repo_beta" },
+      });
+      if (repoBTask.status !== "accepted") throw new Error("repo_beta submission failed");
+
+      expect(controller.snapshot().queue).toEqual([repoATaskTwo]);
+
+      // Finishing the unrelated repo_beta task must not start the queued repo_alpha task,
+      // because repo_alpha is still owned by repoATaskOne.
+      const repoBCompletion = controller.completeTask(Bun.randomUUIDv7(), repoBTask.taskId!, "done", []);
+      expect(repoBCompletion.status).toBe("accepted");
+      expect(controller.snapshot().queue).toEqual([repoATaskTwo]);
+      expect(controller.snapshot().activeTaskIds ?? []).toEqual([repoATaskOne]);
+
+      const repoACompletion = controller.completeTask(Bun.randomUUIDv7(), repoATaskOne, "done", []);
+      expect(repoACompletion.status).toBe("accepted");
+      expect(controller.snapshot().queue).toEqual([]);
+      expect(controller.snapshot().activeTaskIds ?? []).toEqual([repoATaskTwo]);
+    } finally {
+      store.close();
+    }
+  });
+
   test("deduplicates a repeated command without appending events", () => {
     const store = new EventStore();
     try {

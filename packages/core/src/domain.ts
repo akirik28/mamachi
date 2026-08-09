@@ -12,6 +12,8 @@ export type TaskState =
 
 export type RunState = "running" | "paused" | "completed" | "failed" | "cancelled" | "interrupted";
 
+export const MAX_CONCURRENT_TASKS = 4;
+
 export interface WorkspaceConflictRecord {
   paths: string[];
   reason: string;
@@ -97,7 +99,7 @@ export interface ConfirmationRecord {
 
 export interface ControllerState {
   seq: number;
-  activeTaskId: string | null;
+  activeTaskIds: string[];
   queue: string[];
   tasks: Map<string, TaskRecord>;
   runs: Map<string, RunRecord>;
@@ -108,6 +110,7 @@ export interface ControllerState {
 export interface ControllerSnapshot {
   seq: number;
   activeTaskId: string | null;
+  activeTaskIds?: string[];
   queue: string[];
   tasks: TaskRecord[];
   runs: RunRecord[];
@@ -118,7 +121,7 @@ export interface ControllerSnapshot {
 export function createEmptyState(): ControllerState {
   return {
     seq: 0,
-    activeTaskId: null,
+    activeTaskIds: [],
     queue: [],
     tasks: new Map(),
     runs: new Map(),
@@ -210,8 +213,16 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       const taskId = requireTaskId(event);
       const task = requiredTask(state, taskId);
       const runId = event.payload.runId;
-      if (state.activeTaskId && state.activeTaskId !== taskId) {
-        throw new Error(`Cannot start ${taskId}; ${state.activeTaskId} owns the active slot`);
+      if (!state.activeTaskIds.includes(taskId)) {
+        if (state.activeTaskIds.length >= MAX_CONCURRENT_TASKS) {
+          throw new Error(`Cannot start ${taskId}; ${MAX_CONCURRENT_TASKS} tasks are already active`);
+        }
+        const conflictingTaskId = state.activeTaskIds.find(
+          (activeId) => requiredTask(state, activeId).repositoryId === task.repositoryId,
+        );
+        if (conflictingTaskId) {
+          throw new Error(`Cannot start ${taskId}; ${conflictingTaskId} already owns repository ${task.repositoryId}`);
+        }
       }
       if (state.runs.has(runId)) throw new Error(`Run ${runId} already exists`);
       removeFromQueue(state, taskId);
@@ -228,7 +239,7 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
         startedAt: event.at,
         endedAt: null,
       });
-      state.activeTaskId = taskId;
+      if (!state.activeTaskIds.includes(taskId)) state.activeTaskIds.push(taskId);
       break;
     }
     case "task.pauseRequested": {
@@ -350,7 +361,7 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       task.terminalSummary = event.payload.summary;
       task.pendingQuestion = null;
       removeFromQueue(state, taskId);
-      if (state.activeTaskId === taskId) state.activeTaskId = null;
+      state.activeTaskIds = state.activeTaskIds.filter((id) => id !== taskId);
       break;
     }
     case "task.failed": {
@@ -365,7 +376,7 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       task.terminalSummary = event.payload.error;
       task.pendingQuestion = null;
       removeFromQueue(state, taskId);
-      if (state.activeTaskId === taskId) state.activeTaskId = null;
+      state.activeTaskIds = state.activeTaskIds.filter((id) => id !== taskId);
       break;
     }
     case "task.cancelled": {
@@ -382,7 +393,7 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       task.terminalSummary = event.payload.reason;
       task.pendingQuestion = null;
       removeFromQueue(state, taskId);
-      if (state.activeTaskId === taskId) state.activeTaskId = null;
+      state.activeTaskIds = state.activeTaskIds.filter((id) => id !== taskId);
       break;
     }
     case "run.interrupted": {
@@ -468,7 +479,8 @@ export function replayEvents(events: readonly DomainEvent[]): ControllerState {
 export function snapshotState(state: ControllerState): ControllerSnapshot {
   return {
     seq: state.seq,
-    activeTaskId: state.activeTaskId,
+    activeTaskId: state.activeTaskIds[0] ?? null,
+    activeTaskIds: [...state.activeTaskIds],
     queue: [...state.queue],
     tasks: [...state.tasks.values()].map((task) => structuredClone(task)),
     runs: [...state.runs.values()].map((run) => structuredClone(run)),
@@ -487,13 +499,24 @@ export function assertStateInvariants(state: ControllerState): void {
     if (task.state !== "queued") throw new Error(`Queue contains non-queued task ${taskId}`);
   }
 
-  if (state.activeTaskId) {
-    const task = state.tasks.get(state.activeTaskId);
-    if (!task) throw new Error(`Active slot references missing task ${state.activeTaskId}`);
+  if (state.activeTaskIds.length > MAX_CONCURRENT_TASKS) {
+    throw new Error(`${state.activeTaskIds.length} tasks are active; the cap is ${MAX_CONCURRENT_TASKS}`);
+  }
+  if (new Set(state.activeTaskIds).size !== state.activeTaskIds.length) {
+    throw new Error("Active task list contains duplicates");
+  }
+  const activeRepositories = new Set<string>();
+  for (const taskId of state.activeTaskIds) {
+    const task = state.tasks.get(taskId);
+    if (!task) throw new Error(`Active slot references missing task ${taskId}`);
     if (!(["running", "pause_requested", "paused", "awaiting_user"] as TaskState[]).includes(task.state)) {
       throw new Error(`Active task ${task.id} has invalid state ${task.state}`);
     }
     if (queued.has(task.id)) throw new Error(`Active task ${task.id} is also queued`);
+    if (activeRepositories.has(task.repositoryId)) {
+      throw new Error(`Repository ${task.repositoryId} has more than one active task`);
+    }
+    activeRepositories.add(task.repositoryId);
   }
 
   for (const task of state.tasks.values()) {

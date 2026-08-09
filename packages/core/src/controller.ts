@@ -12,6 +12,7 @@ import {
   applyEvent,
   replayEvents,
   snapshotState,
+  MAX_CONCURRENT_TASKS,
   type ControllerSnapshot,
   type ControllerState,
   type TaskRecord,
@@ -123,7 +124,7 @@ export class TaskController {
       () => {
         const task = this.#state.tasks.get(taskId);
         if (!task) return this.#reject("task_not_found", `Task ${taskId} does not exist`);
-        if (task.id !== this.#state.activeTaskId || task.state !== "running" || !task.activeRunId) {
+        if (!this.#state.activeTaskIds.includes(task.id) || task.state !== "running" || !task.activeRunId) {
           return this.#reject("invalid_state", `Task ${taskId} is not running`);
         }
         const duplicateOpenQuestion = [...this.#state.questions.values()].some(
@@ -172,7 +173,7 @@ export class TaskController {
       () => {
         const task = this.#state.tasks.get(taskId);
         if (!task) return this.#reject("task_not_found", `Task ${taskId} does not exist`);
-        if (task.id !== this.#state.activeTaskId || task.activeRunId !== runId) {
+        if (!this.#state.activeTaskIds.includes(task.id) || task.activeRunId !== runId) {
           return this.#reject("stale_run", `Run ${runId} is not active for task ${taskId}`);
         }
         const event = this.#event(
@@ -212,7 +213,7 @@ export class TaskController {
       () => {
         const current = this.#state.tasks.get(taskId);
         if (!current) return this.#reject("task_not_found", `Task ${taskId} does not exist`);
-        if (current.id !== this.#state.activeTaskId || current.state !== "running" || !current.activeRunId) {
+        if (!this.#state.activeTaskIds.includes(current.id) || current.state !== "running" || !current.activeRunId) {
           return this.#reject("invalid_state", `Task ${taskId} is not running`);
         }
 
@@ -345,7 +346,7 @@ export class TaskController {
       () => {
         const task = this.#state.tasks.get(taskId);
         if (!task) return this.#reject("task_not_found", `Task ${taskId} does not exist`);
-        if (task.id !== this.#state.activeTaskId || task.activeRunId !== artifact.runId) {
+        if (!this.#state.activeTaskIds.includes(task.id) || task.activeRunId !== artifact.runId) {
           return this.#reject("stale_run", `Artifact ${artifact.id} does not belong to the active task run`);
         }
         const event = this.#event(
@@ -390,7 +391,7 @@ export class TaskController {
       () => {
         const task = this.#state.tasks.get(taskId);
         if (!task) return this.#reject("task_not_found", `Task ${taskId} does not exist`);
-        if (task.id !== this.#state.activeTaskId || !task.activeRunId || task.state !== "running") {
+        if (!this.#state.activeTaskIds.includes(task.id) || !task.activeRunId || task.state !== "running") {
           return this.#reject("stale_run", `Task ${taskId} has no running slot for a workspace conflict`);
         }
         const runId = task.activeRunId;
@@ -436,45 +437,55 @@ export class TaskController {
         createdAt: this.#now(),
       },
       () => {
-        const taskId = this.#state.activeTaskId;
-        if (!taskId) return this.#reject("nothing_to_recover", "No task owns the active slot");
-        const task = this.#requiredTask(taskId);
-        if (!(task.state === "running" || task.state === "pause_requested") || !task.activeRunId) {
-          return this.#reject("nothing_to_recover", `Task ${taskId} is already ${task.state}`);
+        const recoverableTaskIds = this.#state.activeTaskIds.filter((taskId) => {
+          const task = this.#requiredTask(taskId);
+          return (task.state === "running" || task.state === "pause_requested") && task.activeRunId;
+        });
+        if (recoverableTaskIds.length === 0) {
+          return this.#reject("nothing_to_recover", "No task owns an active slot");
         }
 
-        const runId = task.activeRunId;
-        const interrupted = this.#event(
-          "run.interrupted",
-          { runId, reason: "daemon restarted with an unfinished run" },
-          recoveryId,
-          task,
-          runId,
-        );
-        const recoveryBoundary = task.codingSession
-          ? this.#event(
-              "coder.recoveryBoundary",
-              {
-                sessionId: task.codingSession.id,
-                runId,
-                reason: "Daemon recovery stopped at an unknown in-flight tool boundary; no tool call was replayed",
-                unknownToolCall: true,
-              },
+        const events: NewDomainEvent[] = [];
+        for (const taskId of recoverableTaskIds) {
+          const task = this.#requiredTask(taskId);
+          const runId = task.activeRunId as string;
+          events.push(
+            this.#event(
+              "run.interrupted",
+              { runId, reason: "daemon restarted with an unfinished run" },
               recoveryId,
               task,
               runId,
-              "coder",
-            )
-          : null;
-        const paused = this.#event(
-          "task.paused",
-          { runId, reason: "recovery requires explicit resume" },
-          recoveryId,
-          task,
-          runId,
-        );
-        if (recoveryBoundary) return this.#accept([interrupted, recoveryBoundary, paused], task.id);
-        return this.#accept([interrupted, paused], task.id);
+            ),
+          );
+          if (task.codingSession) {
+            events.push(
+              this.#event(
+                "coder.recoveryBoundary",
+                {
+                  sessionId: task.codingSession.id,
+                  runId,
+                  reason: "Daemon recovery stopped at an unknown in-flight tool boundary; no tool call was replayed",
+                  unknownToolCall: true,
+                },
+                recoveryId,
+                task,
+                runId,
+                "coder",
+              ),
+            );
+          }
+          events.push(
+            this.#event(
+              "task.paused",
+              { runId, reason: "recovery requires explicit resume" },
+              recoveryId,
+              task,
+              runId,
+            ),
+          );
+        }
+        return this.#accept(events);
       },
     );
 
@@ -533,7 +544,9 @@ export class TaskController {
     );
     const events: NewDomainEvent[] = [created, enqueued];
 
-    if (!this.#state.activeTaskId) {
+    const canStartNow =
+      this.#state.activeTaskIds.length < MAX_CONCURRENT_TASKS && !this.#isRepositoryActive(spec.repositoryId);
+    if (canStartNow) {
       events.push(
         this.#event(
           "task.started",
@@ -552,7 +565,7 @@ export class TaskController {
     if (!task) return this.#reject("task_not_found", `Task ${command.payload.taskId} does not exist`);
     const revisionConflict = this.#checkRevision(task, command.expectedRevision);
     if (revisionConflict) return revisionConflict;
-    if (task.id !== this.#state.activeTaskId || task.state !== "running") {
+    if (!this.#state.activeTaskIds.includes(task.id) || task.state !== "running") {
       return this.#reject("invalid_state", `Task ${task.id} is not the running task`);
     }
 
@@ -571,7 +584,7 @@ export class TaskController {
     if (!task) return this.#reject("task_not_found", `Task ${command.payload.taskId} does not exist`);
     const revisionConflict = this.#checkRevision(task, command.expectedRevision);
     if (revisionConflict) return revisionConflict;
-    if (!(task.state === "paused" || task.state === "awaiting_user") || task.id !== this.#state.activeTaskId) {
+    if (!(task.state === "paused" || task.state === "awaiting_user") || !this.#state.activeTaskIds.includes(task.id)) {
       return this.#reject("invalid_state", `Task ${task.id} must be paused or awaiting input before revision`);
     }
     if (command.payload.spec.repositoryId !== task.repositoryId) {
@@ -597,7 +610,7 @@ export class TaskController {
     if (!task) return this.#reject("task_not_found", `Task ${command.payload.taskId} does not exist`);
     const revisionConflict = this.#checkRevision(task, command.expectedRevision);
     if (revisionConflict) return revisionConflict;
-    if (!(task.state === "paused" || task.state === "awaiting_user") || task.id !== this.#state.activeTaskId) {
+    if (!(task.state === "paused" || task.state === "awaiting_user") || !this.#state.activeTaskIds.includes(task.id)) {
       return this.#reject("invalid_state", `Task ${task.id} does not own a resumable active slot`);
     }
 
@@ -660,7 +673,7 @@ export class TaskController {
       question.state !== "open" ||
       question.taskRevision !== task.revision ||
       task.state !== "awaiting_user" ||
-      task.id !== this.#state.activeTaskId
+      !this.#state.activeTaskIds.includes(task.id)
     ) {
       return this.#reject("stale_question", "This question is stale or was already answered");
     }
@@ -698,7 +711,7 @@ export class TaskController {
       return this.#reject("terminal_task", `Task ${task.id} is already ${task.state}`);
     }
 
-    const wasActive = task.id === this.#state.activeTaskId;
+    const wasActive = this.#state.activeTaskIds.includes(task.id);
     const events: NewDomainEvent[] = [
       this.#event(
         "task.cancelled",
@@ -709,7 +722,7 @@ export class TaskController {
       ),
     ];
     if (wasActive) {
-      const startNext = this.#startNextEvent(command.id);
+      const startNext = this.#startNextEvent(command.id, task.id);
       if (startNext) events.push(startNext);
     }
     return this.#accept(events, task.id);
@@ -754,7 +767,7 @@ export class TaskController {
     if (confirmation.taskRevision !== task.revision || confirmation.state !== "pending") {
       return this.#reject("stale_confirmation", "This confirmation is stale or was already resolved");
     }
-    if (task.state !== "awaiting_user" || task.id !== this.#state.activeTaskId) {
+    if (task.state !== "awaiting_user" || !this.#state.activeTaskIds.includes(task.id)) {
       return this.#reject("invalid_state", `Task ${task.id} is not awaiting this approval`);
     }
 
@@ -809,7 +822,7 @@ export class TaskController {
       () => {
         const task = this.#state.tasks.get(taskId);
         if (!task) return this.#reject("task_not_found", `Task ${taskId} does not exist`);
-        if (task.id !== this.#state.activeTaskId || !task.activeRunId) {
+        if (!this.#state.activeTaskIds.includes(task.id) || !task.activeRunId) {
           return this.#reject("invalid_state", `Task ${task.id} has no active run`);
         }
         if (!(task.state === "running" || task.state === "pause_requested")) {
@@ -832,7 +845,7 @@ export class TaskController {
           if (!validation.valid) return this.#reject("verification_incomplete", validation.explanation);
         }
         const events: NewDomainEvent[] = [finished];
-        const startNext = this.#startNextEvent(signalId);
+        const startNext = this.#startNextEvent(signalId, task.id);
         if (startNext) events.push(startNext);
         return this.#accept(events, task.id);
       },
@@ -842,10 +855,23 @@ export class TaskController {
     return execution.result;
   }
 
-  #startNextEvent(correlationId: string): NewDomainEvent<"task.started"> | null {
+  /**
+   * `excludingTaskId` is the task whose termination/cancellation triggered this
+   * call: it still occupies `activeTaskIds` at this point (that event hasn't been
+   * applied yet — events are only applied after this whole command decision
+   * returns), so it must be discounted or it would appear to block its own
+   * repository from immediately handing off to the next queued task.
+   */
+  #startNextEvent(correlationId: string, excludingTaskId?: string): NewDomainEvent<"task.started"> | null {
     const nextTaskId = this.#state.queue[0];
     if (!nextTaskId) return null;
+    const otherActiveTaskIds = this.#state.activeTaskIds.filter((id) => id !== excludingTaskId);
+    if (otherActiveTaskIds.length >= MAX_CONCURRENT_TASKS) return null;
     const nextTask = this.#requiredTask(nextTaskId);
+    const repositoryBusy = otherActiveTaskIds.some(
+      (id) => this.#requiredTask(id).repositoryId === nextTask.repositoryId,
+    );
+    if (repositoryBusy) return null;
     const runId = this.#createId();
     return this.#event(
       "task.started",
@@ -860,6 +886,12 @@ export class TaskController {
     const task = this.#state.tasks.get(taskId);
     if (!task) throw new Error(`Task ${taskId} does not exist`);
     return task;
+  }
+
+  #isRepositoryActive(repositoryId: string): boolean {
+    return this.#state.activeTaskIds.some(
+      (taskId) => this.#requiredTask(taskId).repositoryId === repositoryId,
+    );
   }
 
   #checkRevision(task: TaskRecord, expectedRevision: number): CommandDecision | null {
