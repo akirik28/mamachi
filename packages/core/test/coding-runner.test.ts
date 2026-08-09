@@ -2,9 +2,46 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent";
 import type { DomainEvent } from "@mamachi/protocol";
 import { CodingRunner, type CodingRunnerOptions } from "../src/coding-runner.ts";
 import type { TaskRecord } from "../src/domain.ts";
+import { defaultRuntimeSettings } from "../src/model-router.ts";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// A minimal fake matching just the shape OmpRunner actually touches (same
+// technique as omp-runner.test.ts's createFakeSession, duplicated locally
+// rather than imported since that helper isn't exported and this file's
+// existing style already keeps its own local fixtures self-contained).
+// `prompt` never resolves so the runner stays "mid-turn" until this test
+// externally injects a terminal event -- otherwise the runner's own
+// end-of-turn logic would race ahead and dispose the session on its own,
+// before the test can observe the pre-disposal state.
+function makeFakeSession(disposeCalls: { count: number }, id: string) {
+  const session = {
+    sessionId: id,
+    sessionFile: `/tmp/${id}.jsonl`,
+    sessionManager: { ensureOnDisk: async () => undefined },
+    agent: { waitForIdle: async () => undefined },
+    model: undefined,
+    isStreaming: false,
+    subscribe: () => () => undefined,
+    prompt: async () => new Promise<void>(() => {}),
+    followUp: async () => undefined,
+    steer: async () => undefined,
+    abort: async () => undefined,
+    dispose: async () => {
+      disposeCalls.count += 1;
+    },
+    getLastAssistantMessage: () => ({ stopReason: "stop" }),
+    getLastAssistantText: () => "unused: prompt() never resolves in this fake",
+  };
+  return session;
+}
 
 // WorkspaceGuard (constructed inside OmpRunner/ExternalCliRunner) does real
 // filesystem reads against `repositoryId`, so it must be a real directory —
@@ -172,5 +209,118 @@ describe("CodingRunner", () => {
     // dispose() must not throw calling again with nothing left to dispose.
     await runner.dispose();
     expect(runner.activeTaskCount).toBe(0);
+  });
+
+  test("repeated start -> finish cycles never leak: activeTaskCount returns to exactly 0 every time", async () => {
+    const tasks: Record<string, TaskRecord> = {};
+    const runner = new CodingRunner(makeOptions(tasks));
+    try {
+      for (let cycle = 0; cycle < 4; cycle += 1) {
+        const taskId = `task-cycle-${cycle}`;
+        tasks[taskId] = baseTask(taskId, cycle % 2 === 0 ? "codex" : "claude", tempRepository(`cycle-${cycle}`));
+
+        expect(runner.activeTaskCount).toBe(0);
+        runner.handleEvents([startedEvent(taskId)]);
+        expect(runner.activeTaskCount).toBe(1);
+        runner.handleEvents([completedEvent(taskId)]);
+        expect(runner.activeTaskCount).toBe(0);
+      }
+    } finally {
+      await runner.dispose();
+    }
+  });
+
+  test("dispose() on a terminal event actually tears down that task's concrete backend session, not just the bookkeeping map", async () => {
+    const repoA = tempRepository("a");
+    const repoB = tempRepository("b");
+    const tasks: Record<string, TaskRecord> = {
+      "task-a": baseTask("task-a", "omp", repoA),
+      "task-b": baseTask("task-b", "omp", repoB),
+    };
+    const disposedA = { count: 0 };
+    const disposedB = { count: 0 };
+    const readyA = Promise.withResolvers<void>();
+    const readyB = Promise.withResolvers<void>();
+    const runner = new CodingRunner({
+      ...makeOptions(tasks),
+      emit: (type: string, payload: unknown) => {
+        if (type !== "coder.ready" || !isRecord(payload)) return;
+        if (payload["taskId"] === "task-a") readyA.resolve();
+        if (payload["taskId"] === "task-b") readyB.resolve();
+      },
+      createSession: async (options: { cwd: string }) => {
+        const isA = options.cwd === repoA;
+        return { session: makeFakeSession(isA ? disposedA : disposedB, isA ? "session-a" : "session-b") } as unknown as CreateAgentSessionResult;
+      },
+    } as unknown as CodingRunnerOptions);
+    try {
+      runner.handleEvents([startedEvent("task-a"), startedEvent("task-b")]);
+      await readyA.promise;
+      await readyB.promise;
+      expect(runner.activeTaskCount).toBe(2);
+      expect(disposedA.count).toBe(0);
+      expect(disposedB.count).toBe(0);
+
+      runner.handleEvents([completedEvent("task-a")]);
+      // CodingRunner fires dispose() with `void` (fire-and-forget); flush a macrotask
+      // so the (fake, synchronous) dispose chain has definitely settled before asserting.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(disposedA.count).toBe(1);
+      expect(disposedB.count).toBe(0); // the sibling's own session must never be touched
+      expect(runner.activeTaskCount).toBe(1);
+    } finally {
+      await runner.dispose();
+    }
+  });
+
+  test("configure() updates the settings used for a runner created afterward, while a sibling task's runner stays active", async () => {
+    const repoA = tempRepository("a");
+    const repoB = tempRepository("b");
+    const tasks: Record<string, TaskRecord> = { "task-a": baseTask("task-a", "omp", repoA) };
+    const observed: Array<{ repo: string; thinkingLevel: unknown }> = [];
+    const readyA = Promise.withResolvers<void>();
+    const readyB = Promise.withResolvers<void>();
+    const runner = new CodingRunner({
+      ...makeOptions(tasks),
+      emit: (type: string, payload: unknown) => {
+        if (type !== "coder.ready" || !isRecord(payload)) return;
+        if (payload["taskId"] === "task-a") readyA.resolve();
+        if (payload["taskId"] === "task-b") readyB.resolve();
+      },
+      createSession: async (options: { cwd: string; thinkingLevel: unknown }) => {
+        observed.push({ repo: options.cwd, thinkingLevel: options.thinkingLevel });
+        return { session: makeFakeSession({ count: 0 }, `session-${observed.length}`) } as unknown as CreateAgentSessionResult;
+      },
+      runtimeSettings: defaultRuntimeSettings,
+    } as unknown as CodingRunnerOptions);
+    try {
+      runner.handleEvents([startedEvent("task-a")]);
+      await readyA.promise;
+      expect(observed).toEqual([{ repo: repoA, thinkingLevel: ThinkingLevel.Inherit }]);
+
+      // configure()'s own loop also reaches task-a's already-live runner (coding-runner.ts
+      // iterates every entry of #runners), but OmpRunner only re-reads its runtimeSettings
+      // field at its NEXT fresh session creation -- which, by this architecture's design,
+      // doesn't happen again for a surviving (non-terminal) OMP runner on a plain
+      // pause/resume cycle (the resume path reuses the live session; see the report for the
+      // exact trace). So the settings update to task-a's own runner has no further
+      // independently-observable effect in this test; what IS directly observable, and is
+      // exactly what this test pins, is that the update reaches the runner for a task that
+      // starts afterward, concurrently with task-a still active.
+      runner.configure({ ...defaultRuntimeSettings, thinkingLevel: "high" });
+
+      tasks["task-b"] = baseTask("task-b", "omp", repoB);
+      runner.handleEvents([startedEvent("task-b")]);
+      await readyB.promise;
+
+      expect(observed).toEqual([
+        { repo: repoA, thinkingLevel: ThinkingLevel.Inherit },
+        { repo: repoB, thinkingLevel: ThinkingLevel.High },
+      ]);
+      expect(runner.activeTaskCount).toBe(2);
+    } finally {
+      await runner.dispose();
+    }
   });
 });

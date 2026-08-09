@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ArtifactStore } from "../src/artifact-store.ts";
 import { TaskController } from "../src/controller.ts";
 import { EventStore } from "../src/event-store.ts";
 
@@ -858,6 +859,473 @@ describe("TaskController", () => {
       const replayStore = new EventStore(databasePath);
       const replayed = new TaskController(replayStore).snapshot();
       expect(replayed.tasks).toEqual(live.tasks);
+      replayStore.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("completing one task leaves a concurrently-active sibling's full record untouched", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store, acceptingEvidenceValidator);
+      const taskA = submitToRepo(controller, "repo_a");
+      const taskB = submitToRepo(controller, "repo_b");
+      const beforeB = controller.snapshot().tasks.find((task) => task.id === taskB);
+
+      const completion = controller.completeTask(Bun.randomUUIDv7(), taskA, "done", []);
+      expect(completion.status).toBe("accepted");
+
+      const afterB = controller.snapshot().tasks.find((task) => task.id === taskB);
+      expect(afterB).toEqual(beforeB);
+      expect(controller.snapshot().activeTaskIds).toEqual([taskB]);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("failing one task leaves a concurrently-active sibling's full record untouched", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const taskA = submitToRepo(controller, "repo_a");
+      const taskB = submitToRepo(controller, "repo_b");
+      const beforeB = controller.snapshot().tasks.find((task) => task.id === taskB);
+
+      const failure = controller.failTask(Bun.randomUUIDv7(), taskA, "unrecoverable error");
+      expect(failure.status).toBe("accepted");
+
+      const afterB = controller.snapshot().tasks.find((task) => task.id === taskB);
+      expect(afterB).toEqual(beforeB);
+      expect(controller.snapshot().activeTaskIds).toEqual([taskB]);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("cancelling one task leaves a concurrently-active sibling's full record untouched and releases only its own repository", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const taskA = submitToRepo(controller, "repo_a");
+      const taskB = submitToRepo(controller, "repo_b");
+      const beforeB = controller.snapshot().tasks.find((task) => task.id === taskB);
+
+      const cancelled = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.cancel",
+        actor: "ui",
+        expectedRevision: 1,
+        payload: { taskId: taskA, reason: "No longer needed" },
+      });
+      expect(cancelled.status).toBe("accepted");
+
+      const afterB = controller.snapshot().tasks.find((task) => task.id === taskB);
+      expect(afterB).toEqual(beforeB);
+      expect(controller.snapshot().activeTaskIds).toEqual([taskB]);
+
+      // repo_a is free again: a new task targeting it starts immediately rather than queuing.
+      const thirdTaskId = submitToRepo(controller, "repo_a");
+      expect(controller.snapshot().tasks.find((task) => task.id === thirdTaskId)?.state).toBe("running");
+      expect(controller.snapshot().queue).toEqual([]);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("pausing one task leaves other concurrently-active tasks' full records byte-identical", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const taskA = submitToRepo(controller, "repo_a");
+      const taskB = submitToRepo(controller, "repo_b");
+      const taskC = submitToRepo(controller, "repo_c");
+      const beforeB = controller.snapshot().tasks.find((task) => task.id === taskB);
+      const beforeC = controller.snapshot().tasks.find((task) => task.id === taskC);
+
+      const requested = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.requestPause",
+        actor: "voice",
+        expectedRevision: 1,
+        payload: { taskId: taskA, reason: "Pause A only" },
+      });
+      expect(requested.status).toBe("accepted");
+      const paused = controller.pauseAtSafeBoundary(Bun.randomUUIDv7(), taskA);
+      expect(paused.status).toBe("accepted");
+
+      const afterB = controller.snapshot().tasks.find((task) => task.id === taskB);
+      const afterC = controller.snapshot().tasks.find((task) => task.id === taskC);
+      expect(afterB).toEqual(beforeB);
+      expect(afterC).toEqual(beforeC);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("a paused task still occupies its repository slot: a same-repository submission queues instead of starting", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const taskA = submitToRepo(controller, "repo_a");
+      controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.requestPause",
+        actor: "voice",
+        expectedRevision: 1,
+        payload: { taskId: taskA, reason: "Pause A" },
+      });
+      controller.pauseAtSafeBoundary(Bun.randomUUIDv7(), taskA);
+      expect(controller.snapshot().tasks.find((task) => task.id === taskA)?.state).toBe("paused");
+      expect(controller.snapshot().activeTaskIds).toEqual([taskA]);
+
+      const secondTaskId = submitToRepo(controller, "repo_a");
+      const snapshot = controller.snapshot();
+      expect(snapshot.tasks.find((task) => task.id === secondTaskId)?.state).toBe("queued");
+      expect(snapshot.queue).toEqual([secondTaskId]);
+      expect(snapshot.activeTaskIds).toEqual([taskA]);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("an awaiting_user task still occupies its repository slot: a same-repository submission queues instead of starting", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const taskA = submitToRepo(controller, "repo_a");
+      const awaiting = controller.awaitUserInput(Bun.randomUUIDv7(), taskA, "Which target should I use?");
+      expect(awaiting.status).toBe("accepted");
+      expect(controller.snapshot().tasks.find((task) => task.id === taskA)?.state).toBe("awaiting_user");
+      expect(controller.snapshot().activeTaskIds).toEqual([taskA]);
+
+      const secondTaskId = submitToRepo(controller, "repo_a");
+      const snapshot = controller.snapshot();
+      expect(snapshot.tasks.find((task) => task.id === secondTaskId)?.state).toBe("queued");
+      expect(snapshot.queue).toEqual([secondTaskId]);
+      expect(snapshot.activeTaskIds).toEqual([taskA]);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("a question bound to one task cannot be answered by addressing a different task", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const taskA = submitToRepo(controller, "repo_a");
+      const taskB = submitToRepo(controller, "repo_b");
+      const questionId = Bun.randomUUIDv7();
+      expect(controller.awaitUserInput(questionId, taskA, "Which target for A?").status).toBe("accepted");
+      const taskBRevision = controller.snapshot().tasks.find((task) => task.id === taskB)?.revision ?? 1;
+
+      const wrongTask = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.answerQuestion",
+        actor: "voice",
+        expectedRevision: taskBRevision,
+        payload: { taskId: taskB, questionId, answer: "Deploy to staging." },
+      });
+      expect(wrongTask).toMatchObject({ status: "rejected", code: "question_not_found" });
+
+      // The question is untouched -- still open, still unanswered -- and B never left "running".
+      expect(controller.snapshot().questions?.find((question) => question.id === questionId)).toMatchObject({
+        state: "open",
+        answer: null,
+      });
+      expect(controller.snapshot().tasks.find((task) => task.id === taskA)?.state).toBe("awaiting_user");
+      expect(controller.snapshot().tasks.find((task) => task.id === taskB)?.state).toBe("running");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("resolving one task's confirmation leaves a sibling task's separate pending confirmation untouched", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const taskA = submitToRepo(controller, "repo_a");
+      const taskB = submitToRepo(controller, "repo_b");
+
+      const proposedA = controller.authorizeToolCall(Bun.randomUUIDv7(), taskA, "bash", {
+        command: "git push origin main",
+      });
+      if (proposedA.status !== "confirmation_required") throw new Error("Expected A's risky action to require approval");
+      const proposedB = controller.authorizeToolCall(Bun.randomUUIDv7(), taskB, "bash", {
+        command: "rm -rf build",
+      });
+      if (proposedB.status !== "confirmation_required") throw new Error("Expected B's risky action to require approval");
+
+      const beforeB = controller.snapshot().confirmations.find((confirmation) => confirmation.id === proposedB.confirmationId);
+      expect(beforeB?.state).toBe("pending");
+
+      const resolvedA = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "approval.resolve",
+        actor: "ui",
+        expectedRevision: 1,
+        payload: { confirmationId: proposedA.confirmationId, decision: "approve" },
+      });
+      expect(resolvedA.status).toBe("accepted");
+
+      const afterB = controller.snapshot().confirmations.find((confirmation) => confirmation.id === proposedB.confirmationId);
+      expect(afterB).toEqual(beforeB);
+      expect(controller.snapshot().tasks.find((task) => task.id === taskA)?.state).toBe("running");
+      expect(controller.snapshot().tasks.find((task) => task.id === taskB)?.state).toBe("awaiting_user");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("a run id belonging to a different task is rejected as stale rather than accepted cross-task", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const taskA = submitToRepo(controller, "repo_a");
+      const taskB = submitToRepo(controller, "repo_b");
+      const runIdOfA = controller.snapshot().tasks.find((task) => task.id === taskA)?.activeRunId;
+      if (!runIdOfA) throw new Error("Task A did not start");
+
+      const crossed = controller.recordCoderSession(
+        Bun.randomUUIDv7(),
+        taskB,
+        runIdOfA,
+        "omp",
+        "cross-task-session",
+        "/tmp/cross-task-session.jsonl",
+      );
+      expect(crossed).toMatchObject({ status: "rejected", code: "stale_run" });
+      expect(controller.snapshot().tasks.find((task) => task.id === taskB)?.codingSession).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+
+  test("late signals addressed to a task's old run cannot mutate it once the task has finished", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store, acceptingEvidenceValidator);
+      const taskId = submit(controller);
+      const originalRunId = controller.snapshot().tasks[0]?.activeRunId;
+      if (!originalRunId) throw new Error("Task did not start");
+
+      const completion = controller.completeTask(Bun.randomUUIDv7(), taskId, "done", []);
+      expect(completion.status).toBe("accepted");
+
+      const lateArtifact = controller.recordArtifact(Bun.randomUUIDv7(), taskId, {
+        id: Bun.randomUUIDv7(),
+        ordinal: 1,
+        taskId,
+        runId: originalRunId,
+        toolCallId: "late-1",
+        toolName: "bash",
+        kind: "tool_result",
+        summary: "A late tool result from the finished run",
+        successful: true,
+        payload: {},
+        createdAt: new Date().toISOString(),
+      });
+      expect(lateArtifact).toMatchObject({ status: "rejected", code: "stale_run" });
+
+      const lateAuthorize = controller.authorizeToolCall(Bun.randomUUIDv7(), taskId, "bash", { command: "echo hi" });
+      expect(lateAuthorize).toMatchObject({ status: "rejected", code: "invalid_state" });
+
+      const latePause = controller.pauseAtSafeBoundary(Bun.randomUUIDv7(), taskId);
+      expect(latePause).toMatchObject({ status: "rejected", code: "invalid_state" });
+
+      const lateQuestion = controller.awaitUserInput(Bun.randomUUIDv7(), taskId, "Still relevant?");
+      expect(lateQuestion).toMatchObject({ status: "rejected", code: "invalid_state" });
+
+      expect(controller.snapshot().tasks[0]).toMatchObject({ state: "completed", evidenceIds: [] });
+    } finally {
+      store.close();
+    }
+  });
+
+  test("task B cannot complete using task A's evidence, even though both tasks are concurrently active", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mamachi-cross-evidence-"));
+    const databasePath = join(directory, "state.sqlite");
+    const events = new EventStore(databasePath);
+    const artifacts = new ArtifactStore(databasePath);
+    try {
+      const controller = new TaskController(events, {
+        validateEvidence: (taskId, runId, evidenceIds) => artifacts.validateCompletion(taskId, runId, evidenceIds),
+      });
+      const taskA = submitToRepo(controller, "repo_evidence_a");
+      const taskB = submitToRepo(controller, "repo_evidence_b");
+      const runA = controller.snapshot().tasks.find((task) => task.id === taskA)?.activeRunId;
+      if (!runA) throw new Error("Task A did not start");
+
+      const changedA = artifacts.recordToolEvidence({
+        taskId: taskA,
+        runId: runA,
+        repository: "repo_evidence_a",
+        toolCallId: "write-a",
+        toolName: "write",
+        input: { path: "a.ts", content: "export const a = 1;" },
+        result: { status: "ok" },
+        isError: false,
+      });
+      expect(controller.recordArtifact(Bun.randomUUIDv7(), taskA, changedA).status).toBe("accepted");
+      const verifiedA = artifacts.recordToolEvidence({
+        taskId: taskA,
+        runId: runA,
+        repository: "repo_evidence_a",
+        toolCallId: "test-a",
+        toolName: "bash",
+        input: { command: "bun test" },
+        result: { exitCode: 0 },
+        isError: false,
+      });
+      expect(controller.recordArtifact(Bun.randomUUIDv7(), taskA, verifiedA).status).toBe("accepted");
+
+      // If A's evidence (bug) leaked into B's completion check, citing it would wrongly satisfy B's gate.
+      const crossCompletion = controller.completeTask(Bun.randomUUIDv7(), taskB, "Borrowed A's evidence", [
+        changedA.id,
+        verifiedA.id,
+      ]);
+      expect(crossCompletion).toMatchObject({ status: "rejected", code: "verification_incomplete" });
+      expect(controller.snapshot().tasks.find((task) => task.id === taskB)?.state).toBe("running");
+
+      // A's own completion, citing its own evidence, legitimately succeeds -- proving the
+      // gate isn't just unconditionally rejecting, only cross-task evidence specifically.
+      const ownCompletion = controller.completeTask(Bun.randomUUIDv7(), taskA, "Implemented and verified", [
+        changedA.id,
+        verifiedA.id,
+      ]);
+      expect(ownCompletion.status).toBe("accepted");
+    } finally {
+      artifacts.close();
+      events.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("recovering twice in a row finds nothing left to recover the second time", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mamachi-recovery-idempotent-"));
+    const databasePath = join(directory, "state.sqlite");
+    try {
+      const firstStore = new EventStore(databasePath);
+      const firstController = new TaskController(firstStore);
+      submitToRepo(firstController, "repo_a");
+      submitToRepo(firstController, "repo_b");
+      firstStore.close();
+
+      const recoveryStore = new EventStore(databasePath);
+      const recoveryController = new TaskController(recoveryStore);
+      const first = recoveryController.recoverAfterRestart(Bun.randomUUIDv7());
+      expect(first.status).toBe("accepted");
+      // Calling it again on the same controller, without an intervening resume,
+      // must not re-interrupt already-paused tasks: there is nothing running anymore.
+      const second = recoveryController.recoverAfterRestart(Bun.randomUUIDv7());
+      expect(second).toMatchObject({ status: "rejected", code: "nothing_to_recover" });
+
+      const snapshot = recoveryController.snapshot();
+      expect(snapshot.tasks.every((task) => task.state === "paused")).toBe(true);
+      recoveryStore.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("recovery only touches genuinely running/pause_requested tasks, leaving already-paused and awaiting_user tasks alone", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mamachi-recovery-mixed-"));
+    const databasePath = join(directory, "state.sqlite");
+    try {
+      const firstStore = new EventStore(databasePath);
+      const firstController = new TaskController(firstStore);
+      const runningTask = submitToRepo(firstController, "repo_running");
+      const pausedTask = submitToRepo(firstController, "repo_paused");
+      const awaitingTask = submitToRepo(firstController, "repo_awaiting");
+
+      firstController.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.requestPause",
+        actor: "voice",
+        expectedRevision: 1,
+        payload: { taskId: pausedTask, reason: "Pause before recovery" },
+      });
+      firstController.pauseAtSafeBoundary(Bun.randomUUIDv7(), pausedTask);
+      firstController.awaitUserInput(Bun.randomUUIDv7(), awaitingTask, "Which target?");
+
+      const beforePaused = firstController.snapshot().tasks.find((task) => task.id === pausedTask);
+      const beforeAwaiting = firstController.snapshot().tasks.find((task) => task.id === awaitingTask);
+      firstStore.close();
+
+      const recoveryStore = new EventStore(databasePath);
+      const recoveryController = new TaskController(recoveryStore);
+      const recovery = recoveryController.recoverAfterRestart(Bun.randomUUIDv7());
+      expect(recovery.status).toBe("accepted");
+
+      const snapshot = recoveryController.snapshot();
+      expect(snapshot.tasks.find((task) => task.id === runningTask)?.state).toBe("paused");
+      // Recovery is scoped exactly to the one task that genuinely needed it; the two
+      // tasks that were already stopped for a different reason are untouched.
+      expect(snapshot.tasks.find((task) => task.id === pausedTask)).toEqual(beforePaused);
+      expect(snapshot.tasks.find((task) => task.id === awaitingTask)).toEqual(beforeAwaiting);
+      recoveryStore.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("recovery never crosses task/run association even when multiple tasks have bound coder sessions", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mamachi-recovery-association-"));
+    const databasePath = join(directory, "state.sqlite");
+    try {
+      const firstStore = new EventStore(databasePath);
+      const firstController = new TaskController(firstStore);
+      const taskA = submitToRepo(firstController, "repo_a");
+      const taskB = submitToRepo(firstController, "repo_b");
+      const runA = firstController.snapshot().tasks.find((task) => task.id === taskA)?.activeRunId;
+      const runB = firstController.snapshot().tasks.find((task) => task.id === taskB)?.activeRunId;
+      if (!runA || !runB) throw new Error("Both tasks should have started");
+      expect(
+        firstController.recordCoderSession(Bun.randomUUIDv7(), taskA, runA, "omp", "session-a", "/tmp/session-a.jsonl")
+          .status,
+      ).toBe("accepted");
+      expect(
+        firstController.recordCoderSession(Bun.randomUUIDv7(), taskB, runB, "codex", "session-b", null).status,
+      ).toBe("accepted");
+      firstStore.close();
+
+      const recoveryStore = new EventStore(databasePath);
+      const recoveryController = new TaskController(recoveryStore);
+      expect(recoveryController.recoverAfterRestart(Bun.randomUUIDv7()).status).toBe("accepted");
+
+      const snapshot = recoveryController.snapshot();
+      const finalA = snapshot.tasks.find((task) => task.id === taskA);
+      const finalB = snapshot.tasks.find((task) => task.id === taskB);
+      expect(finalA?.codingSession).toMatchObject({ backend: "omp", id: "session-a" });
+      expect(finalA?.codingSession?.recoveryBoundary).toMatchObject({ runId: runA });
+      expect(finalB?.codingSession).toMatchObject({ backend: "codex", id: "session-b" });
+      expect(finalB?.codingSession?.recoveryBoundary).toMatchObject({ runId: runB });
+      recoveryStore.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("an event log recorded before multi-repo concurrency (never more than one active task) replays cleanly through the current reducer", () => {
+    const directory = mkdtempSync(join(tmpdir(), "mamachi-backward-compat-"));
+    const databasePath = join(directory, "state.sqlite");
+    try {
+      const store = new EventStore(databasePath);
+      const controller = new TaskController(store, acceptingEvidenceValidator);
+      // Exercise exactly the pattern the single-task-only version of this app produced:
+      // submit, complete, submit, complete -- activeTaskIds never exceeds length 1.
+      const first = submit(controller);
+      expect(controller.completeTask(Bun.randomUUIDv7(), first, "done", []).status).toBe("accepted");
+      const second = submit(controller);
+      expect(controller.completeTask(Bun.randomUUIDv7(), second, "done", []).status).toBe("accepted");
+      const liveSnapshot = controller.snapshot();
+      store.close();
+
+      const replayStore = new EventStore(databasePath);
+      const replayed = new TaskController(replayStore, acceptingEvidenceValidator).snapshot();
+      expect(replayed.tasks).toEqual(liveSnapshot.tasks);
+      expect(replayed.activeTaskIds).toEqual([]);
+      expect(replayed.activeTaskId).toBeNull();
       replayStore.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });

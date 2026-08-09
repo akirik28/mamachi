@@ -236,6 +236,42 @@ describe("createVoiceToolkit", () => {
     toolkit.dispose();
   });
 
+  test("get_task_status with no taskId resolves to the snapshot's reported active task, not any client-side focus", async () => {
+    // With two tasks concurrently active (multi-repo concurrency), the toolkit has no
+    // notion of the Swift app's client-local tap-to-focus choice -- see
+    // AppModel.focusTask's doc comment in apps/macos. It only ever reads
+    // `snapshot.activeTaskId`, which is the daemon's derived "oldest started" active
+    // task (domain.ts snapshotState: `activeTaskIds[0]`). This test pins that exact
+    // fallback so a change to #resolveTask's null-taskId behavior is caught here
+    // rather than discovered as a live UX bug.
+    const taskA = makeTask({ id: "task-a", state: "running" });
+    const taskB = makeTask({ id: "task-b", state: "running" });
+    const snapshot: ControllerSnapshot = {
+      seq: 1,
+      activeTaskId: "task-a",
+      activeTaskIds: ["task-a", "task-b"],
+      queue: [],
+      tasks: [taskA, taskB],
+      runs: [],
+      confirmations: [],
+      questions: [],
+    };
+    const { host } = makeHost({ getSnapshot: () => snapshot });
+    const toolkit = createVoiceToolkit(host);
+    const resolved = asRecord(await toolkit.execute("get_task_status", { taskId: null, view: "brief" }));
+    expect(resolved["id"]).toBe("task-a");
+    toolkit.dispose();
+
+    // Prove this actually tracks `activeTaskId` and isn't coincidentally "the first
+    // or last task in the array": swap which one the snapshot calls active.
+    const swappedSnapshot: ControllerSnapshot = { ...snapshot, activeTaskId: "task-b" };
+    const { host: swappedHost } = makeHost({ getSnapshot: () => swappedSnapshot });
+    const swappedToolkit = createVoiceToolkit(swappedHost);
+    const resolvedAfterSwap = asRecord(await swappedToolkit.execute("get_task_status", { taskId: null, view: "brief" }));
+    expect(resolvedAfterSwap["id"]).toBe("task-b");
+    swappedToolkit.dispose();
+  });
+
   test("enforces the exact realtime validation error messages", async () => {
     const toolkit = createVoiceToolkit(makeHost().host);
     await expect(toolkit.execute("get_task_status", "brief")).rejects.toThrow("get_task_status arguments must be an object");
