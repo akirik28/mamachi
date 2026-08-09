@@ -159,12 +159,14 @@ export class MamachiIpcServer {
   readonly #clients = new Set<ClientSocket>();
   readonly #server: Server<ClientData>;
   #workspace: string;
+  readonly #workspaces = new Set<string>();
   readonly #screenshotDirectory: string | null;
 
   constructor(options: IpcServerOptions) {
     this.#token = options.token;
     this.#hooks = options.hooks ?? {};
     this.#workspace = realpathSync(options.initialWorkspace ?? process.cwd());
+    this.#workspaces.add(this.#workspace);
     const databasePath = options.databasePath ?? ":memory:";
     this.#screenshotDirectory = databasePath === ":memory:"
       ? null
@@ -215,6 +217,11 @@ export class MamachiIpcServer {
 
   get workspace(): string {
     return this.#workspace;
+  }
+
+  /** Every repository registered for task submission, canonical realpaths. */
+  get workspaces(): string[] {
+    return [...this.#workspaces];
   }
 
   emit(type: string, payload: unknown): void {
@@ -323,17 +330,33 @@ export class MamachiIpcServer {
   async executeCommand(input: unknown): Promise<ActionResult> {
     const command = parseCommand(input);
     if (command.type === "task.submit") {
-      if (command.payload.repositoryId !== this.#workspace) {
+      let canonicalRepositoryId: string;
+      try {
+        canonicalRepositoryId = realpathSync(command.payload.repositoryId);
+      } catch {
         return {
           status: "rejected",
           code: "workspace_mismatch",
-          explanation: "The task repository does not match the selected workspace",
+          explanation: "The task repository does not exist or is not accessible",
         };
       }
-      const attachments = this.#artifacts.get(command.payload.attachmentIds);
+      if (!this.#workspaces.has(canonicalRepositoryId)) {
+        return {
+          status: "rejected",
+          code: "workspace_mismatch",
+          explanation: "The task repository is not a registered workspace",
+        };
+      }
+      // Canonicalize before it reaches the controller: two aliases (a
+      // symlink vs. its real path) for the same repository must be treated
+      // as the same repositoryId everywhere, or the one-active-task-per-
+      // repository mutex in domain.ts could be defeated by submitting
+      // through a different alias string.
+      const submitCommand = { ...command, payload: { ...command.payload, repositoryId: canonicalRepositoryId } };
+      const attachments = this.#artifacts.get(submitCommand.payload.attachmentIds);
       if (
-        attachments.length !== command.payload.attachmentIds.length ||
-        attachments.some((artifact) => artifact.workspace !== command.payload.repositoryId)
+        attachments.length !== submitCommand.payload.attachmentIds.length ||
+        attachments.some((artifact) => artifact.workspace !== submitCommand.payload.repositoryId)
       ) {
         return {
           status: "rejected",
@@ -341,6 +364,10 @@ export class MamachiIpcServer {
           explanation: "Every task attachment must exist and belong to the selected workspace",
         };
       }
+      const beforeSeq = this.#controller.snapshot().seq;
+      const result = this.#controller.handle(submitCommand);
+      await this.#publishControllerEvents(beforeSeq);
+      return result;
     }
     const beforeSeq = this.#controller.snapshot().seq;
     const result = this.#controller.handle(command);
@@ -511,8 +538,13 @@ export class MamachiIpcServer {
         const path = realpathSync(request.payload["path"]);
         if (!statSync(path).isDirectory()) throw new Error("Selected workspace is not a directory");
         this.#workspace = path;
-        this.emit("workspace.changed", { path, source: request.type === "workspace.focus" ? "vscode" : "user" });
-        return { path };
+        this.#workspaces.add(path);
+        this.emit("workspace.changed", {
+          path,
+          workspaces: [...this.#workspaces],
+          source: request.type === "workspace.focus" ? "vscode" : "user",
+        });
+        return { path, workspaces: [...this.#workspaces] };
       }
       case "editor.state": {
         if (

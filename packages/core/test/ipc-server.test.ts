@@ -304,3 +304,182 @@ test("IPC artifact getters enforce task ownership", async () => {
     rmSync(workspace, { recursive: true, force: true });
   }
 });
+
+test("IPC rejects a task submitted against a repository that was never registered", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "mamachi-ipc-workspace-registry-"));
+  const otherRepo = mkdtempSync(join(tmpdir(), "mamachi-ipc-workspace-unregistered-"));
+  const server = new MamachiIpcServer({
+    token: "workspace-registry-token",
+    port: 0,
+    initialWorkspace: workspace,
+  });
+  try {
+    const result = await server.executeCommand({
+      id: Bun.randomUUIDv7(),
+      type: "task.submit",
+      actor: "voice",
+      expectedRevision: null,
+      payload: {
+        repositoryId: realpathSync(otherRepo),
+        objective: "Fix a bug in a repo nobody registered",
+        acceptanceCriteria: ["It compiles"],
+        constraints: [],
+        attachmentIds: [],
+        codingProfileId: null,
+      },
+    });
+    expect(result).toMatchObject({ status: "rejected", code: "workspace_mismatch" });
+    expect(server.snapshot().tasks).toEqual([]);
+  } finally {
+    server.close();
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(otherRepo, { recursive: true, force: true });
+  }
+});
+
+test("workspace.select registers a second repository without displacing the first", async () => {
+  const firstWorkspace = mkdtempSync(join(tmpdir(), "mamachi-ipc-workspace-first-"));
+  const secondWorkspace = mkdtempSync(join(tmpdir(), "mamachi-ipc-workspace-second-"));
+  const server = new MamachiIpcServer({
+    token: "workspace-multi-token",
+    port: 0,
+    initialWorkspace: firstWorkspace,
+  });
+  const socket = new WebSocket(`ws://127.0.0.1:${server.port}/ws`, {
+    headers: { Authorization: "Bearer workspace-multi-token" },
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", () => resolve());
+      socket.once("error", reject);
+    });
+
+    const selected = await request(socket, "workspace.select", { path: secondWorkspace });
+    expect(selected.ok).toBe(true);
+
+    // The first task, submitted before the second workspace was ever
+    // selected, must still be accepted -- registering a new repository is
+    // additive, not a replacement of the one the daemon started with.
+    const first = await server.executeCommand({
+      id: Bun.randomUUIDv7(),
+      type: "task.submit",
+      actor: "voice",
+      expectedRevision: null,
+      payload: {
+        repositoryId: realpathSync(firstWorkspace),
+        objective: "Work in the original repository",
+        acceptanceCriteria: ["It works"],
+        constraints: [],
+        attachmentIds: [],
+        codingProfileId: null,
+      },
+    });
+    expect(first.status).toBe("accepted");
+
+    const second = await server.executeCommand({
+      id: Bun.randomUUIDv7(),
+      type: "task.submit",
+      actor: "voice",
+      expectedRevision: null,
+      payload: {
+        repositoryId: realpathSync(secondWorkspace),
+        objective: "Work in the newly selected repository",
+        acceptanceCriteria: ["It also works"],
+        constraints: [],
+        attachmentIds: [],
+        codingProfileId: null,
+      },
+    });
+    expect(second.status).toBe("accepted");
+
+    const repositoryIds = server.snapshot().tasks.map((task) => task.repositoryId).sort();
+    expect(repositoryIds).toEqual([realpathSync(firstWorkspace), realpathSync(secondWorkspace)].sort());
+  } finally {
+    socket.close();
+    server.close();
+    rmSync(firstWorkspace, { recursive: true, force: true });
+    rmSync(secondWorkspace, { recursive: true, force: true });
+  }
+});
+
+test("a symlink alias to a registered repository is accepted, not treated as a different workspace", async () => {
+  const realWorkspace = mkdtempSync(join(tmpdir(), "mamachi-ipc-workspace-real-"));
+  const aliasPath = join(tmpdir(), `mamachi-ipc-workspace-alias-${Bun.randomUUIDv7()}`);
+  const { symlinkSync, unlinkSync } = await import("node:fs");
+  symlinkSync(realWorkspace, aliasPath);
+  const server = new MamachiIpcServer({
+    token: "workspace-alias-token",
+    port: 0,
+    initialWorkspace: realWorkspace,
+  });
+  try {
+    // Submit through the alias path, never the canonical one directly.
+    const result = await server.executeCommand({
+      id: Bun.randomUUIDv7(),
+      type: "task.submit",
+      actor: "voice",
+      expectedRevision: null,
+      payload: {
+        repositoryId: aliasPath,
+        objective: "Submitted through a symlink alias",
+        acceptanceCriteria: ["It resolves to the same repository"],
+        constraints: [],
+        attachmentIds: [],
+        codingProfileId: null,
+      },
+    });
+    expect(result.status).toBe("accepted");
+    // Stored identity is the canonical path, not the alias -- otherwise the
+    // per-repository concurrency mutex could be defeated by two tasks
+    // referencing the same real directory through different alias strings.
+    expect(server.snapshot().tasks[0]?.repositoryId).toBe(realpathSync(realWorkspace));
+  } finally {
+    server.close();
+    unlinkSync(aliasPath);
+    rmSync(realWorkspace, { recursive: true, force: true });
+  }
+});
+
+test("workspace.select rejects a path that does not exist, without corrupting the registry", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "mamachi-ipc-workspace-badpath-"));
+  const server = new MamachiIpcServer({
+    token: "workspace-badpath-token",
+    port: 0,
+    initialWorkspace: workspace,
+  });
+  const socket = new WebSocket(`ws://127.0.0.1:${server.port}/ws`, {
+    headers: { Authorization: "Bearer workspace-badpath-token" },
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", () => resolve());
+      socket.once("error", reject);
+    });
+
+    const rejected = await request(socket, "workspace.select", {
+      path: join(workspace, "does-not-exist"),
+    });
+    expect(rejected.ok).toBe(false);
+
+    // The original workspace must still be the only registered one.
+    const stillWorks = await server.executeCommand({
+      id: Bun.randomUUIDv7(),
+      type: "task.submit",
+      actor: "voice",
+      expectedRevision: null,
+      payload: {
+        repositoryId: realpathSync(workspace),
+        objective: "The original workspace survives a bad selection attempt",
+        acceptanceCriteria: ["It still works"],
+        constraints: [],
+        attachmentIds: [],
+        codingProfileId: null,
+      },
+    });
+    expect(stillWorks.status).toBe("accepted");
+  } finally {
+    socket.close();
+    server.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});

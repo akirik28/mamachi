@@ -161,9 +161,21 @@ describe("createVoiceToolkit", () => {
     ]);
     expect(toolkit.tools().every((tool) => tool.type === "function" && tool.parameters["type"] === "object")).toBe(true);
     const instructions = toolkit.instructions();
-    expect(instructions).toContain("# Current workspace\n/repo");
+    expect(instructions).toContain("Active: /repo");
+    expect(instructions).toContain("Available for submit_task's repositoryId: /repo");
     expect(instructions).toContain("Enabled capability categories: applications, shell.");
     expect(instructions).toContain("Confirmation policy: always.");
+    toolkit.dispose();
+  });
+
+  test("lists every registered repository in the instructions, not just the active one", () => {
+    const { host } = makeHost({
+      getAvailableWorkspaces: () => ["/repo", "/repo-two", "/repo-three"],
+    });
+    const toolkit = createVoiceToolkit(host);
+    const instructions = toolkit.instructions();
+    expect(instructions).toContain("Active: /repo");
+    expect(instructions).toContain("Available for submit_task's repositoryId: /repo, /repo-two, /repo-three");
     toolkit.dispose();
   });
 
@@ -270,6 +282,21 @@ describe("createVoiceToolkit", () => {
     const resolvedAfterSwap = asRecord(await swappedToolkit.execute("get_task_status", { taskId: null, view: "brief" }));
     expect(resolvedAfterSwap["id"]).toBe("task-b");
     swappedToolkit.dispose();
+  });
+
+  test("get_workspace reports every registered repository, deduplicated, not just the active one", async () => {
+    const { host } = makeHost({
+      getAvailableWorkspaces: () => ["/repo", "/repo-two", "/repo", "/repo-two"],
+    });
+    const toolkit = createVoiceToolkit(host);
+    expect(await toolkit.execute("get_workspace", { view: "active" })).toEqual({
+      repositoryId: "/repo",
+      path: "/repo",
+    });
+    expect(await toolkit.execute("get_workspace", { view: "available" })).toEqual({
+      repositories: ["/repo", "/repo-two"],
+    });
+    toolkit.dispose();
   });
 
   test("enforces the exact realtime validation error messages", async () => {

@@ -130,8 +130,9 @@ Default to one short spoken sentence of at most 20 words. Do not restate the req
 # Audio
 If audio is unclear, ask briefly rather than guessing. If audio is silence, media, background speech, or not addressed to you, call wait_for_user and remain silent.
 
-# Current workspace
-${this.#host.getWorkspace()}
+# Workspaces
+Active: ${this.#host.getWorkspace()}
+Available for submit_task's repositoryId: ${(this.#host.getAvailableWorkspaces?.() ?? [this.#host.getWorkspace()]).join(", ")}
 `;
   }
 
