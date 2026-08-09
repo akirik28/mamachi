@@ -73,6 +73,13 @@ struct TaskDrawerView: View {
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(Theme.brand)
                 SectionLabel("Current objective")
+                if !task.repositoryLabel.isEmpty {
+                    Text(task.repositoryLabel)
+                        .font(.system(size: 8.5, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .help(task.repositoryId)
+                }
                 Spacer()
                 if let createdAt = task.createdAt, !task.isTerminal {
                     Text(createdAt, style: .relative)
@@ -321,7 +328,7 @@ struct TaskDrawerView: View {
                                 .font(.system(size: 10.5, weight: .semibold))
                                 .foregroundStyle(.primary)
                                 .lineLimit(1)
-                            Text(task.stateLabel)
+                            Text(task.repositoryLabel.isEmpty ? task.stateLabel : "\(task.stateLabel) · \(task.repositoryLabel)")
                                 .font(.system(size: 9))
                                 .foregroundStyle(.secondary)
                         }
@@ -329,6 +336,7 @@ struct TaskDrawerView: View {
                     }
                 }
                 .buttonStyle(.plain)
+                .help(task.repositoryId)
                 if task.id != otherRunningTasks.last?.id {
                     Divider().opacity(0.4)
                 }

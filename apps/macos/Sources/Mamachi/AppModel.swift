@@ -1021,6 +1021,7 @@ final class AppModel: ObservableObject {
                 terminalSummary: rawTask["terminalSummary"] as? String,
                 recentActivity: previous?.recentActivity
             )
+            task.repositoryId = rawTask["repositoryId"] as? String ?? ""
             task.pendingQuestion = rawTask["pendingQuestion"] as? String
             task.createdAt = Self.parseDate(rawTask["createdAt"])
             task.specHistory = (rawTask["specHistory"] as? [[String: Any]] ?? []).compactMap { entry in
