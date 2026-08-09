@@ -8,6 +8,7 @@ import type {
   ComputerControlResult,
 } from "./computer-control.ts";
 import type { TaskFacts } from "./fact-projector.ts";
+import type { PullRequestRequest, PullRequestResult } from "./pull-request.ts";
 import type { MemoryScope } from "./memory-store.ts";
 import type { VoiceBrief } from "./voice-brief-store.ts";
 
@@ -82,6 +83,11 @@ export interface VoiceHostCallbacks {
   };
   forgetFact?: (memoryId: string) => boolean;
   controlComputer?: (request: ComputerControlRequest) => Promise<ComputerControlResult>;
+  /// Pushes a task's branch and opens (or finds) a pull request. Host-side
+  /// only -- the toolkit never runs git/gh itself, only calls this after an
+  /// explicit user confirmation (see `open_pull_request` /
+  /// `resolve_open_pull_request` in `voice-toolkit.ts`).
+  openPullRequest?: (request: PullRequestRequest) => Promise<PullRequestResult>;
   emit: (type: string, payload: unknown) => void;
   /// Registers a screen capture as an attachable context artifact (returns
   /// the stored artifact) so voice can hand pixels to the coding agent.

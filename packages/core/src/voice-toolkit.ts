@@ -38,6 +38,14 @@ interface PendingComputerControl {
   timeout: TimerHandle;
 }
 
+interface PendingPullRequest {
+  taskId: string;
+  title: string;
+  body: string;
+  expiresAt: number;
+  timeout: TimerHandle;
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -76,6 +84,7 @@ class CascadeVoiceToolkit implements VoiceToolkit {
   readonly #recentActivity = new Map<string, { type: string; summary: string; at: string }>();
   readonly #pendingContext = new Map<string, CapturedContext>();
   readonly #pendingComputerControls = new Map<string, PendingComputerControl>();
+  readonly #pendingPullRequests = new Map<string, PendingPullRequest>();
 
   constructor(host: VoiceToolHost) {
     this.#host = host;
@@ -441,6 +450,36 @@ Available for submit_task's repositoryId: ${(this.#host.getAvailableWorkspaces?.
         type: "function",
         name: "resolve_computer_control",
         description: "Approve or reject one exact pending computer action after the user's explicit decision.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            requestId: { type: "string", minLength: 1 },
+            decision: { type: "string", enum: ["approve", "reject"] },
+          },
+          required: ["requestId", "decision"],
+        },
+      },
+      {
+        type: "function",
+        name: "open_pull_request",
+        description:
+          "Push a task's branch and open (or find) a pull request. Always requires the user's explicit confirmation before it runs -- never call this speculatively.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            taskId: { type: "string", minLength: 1 },
+            title: { type: "string", minLength: 1 },
+            body: { type: "string" },
+          },
+          required: ["taskId", "title", "body"],
+        },
+      },
+      {
+        type: "function",
+        name: "resolve_open_pull_request",
+        description: "Approve or reject one exact pending pull-request request after the user's explicit decision.",
         parameters: {
           type: "object",
           additionalProperties: false,
@@ -936,6 +975,87 @@ Available for submit_task's repositoryId: ${(this.#host.getAvailableWorkspaces?.
         }
         return this.#runComputerControl(pending.request);
       }
+      case "open_pull_request": {
+        assertOnlyKeys(input, ["taskId", "title", "body"], name);
+        const taskId = requireString(input["taskId"], "taskId");
+        const title = requireString(input["title"], "title");
+        if (typeof input["body"] !== "string") throw new Error("body must be a string");
+        const body = input["body"];
+        if (!this.#host.openPullRequest) {
+          return {
+            status: "rejected",
+            code: "pull_request_unavailable",
+            explanation: "Opening pull requests is unavailable in this Mamachi runtime",
+          };
+        }
+        if (!this.#resolveTask(taskId)) {
+          return { status: "rejected", code: "task_not_found", explanation: `Task ${taskId} does not exist` };
+        }
+        this.clearPendingPullRequests("superseded");
+        const requestId = Bun.randomUUIDv7();
+        const expiresAt = Date.now() + 120_000;
+        const timeout = setTimeout(() => {
+          const expired = this.#pendingPullRequests.get(requestId);
+          if (!expired) return;
+          this.#pendingPullRequests.delete(requestId);
+          this.#host.emit("pull_request.confirmation_expired", { requestId, taskId });
+        }, 120_000);
+        this.#pendingPullRequests.set(requestId, { taskId, title, body, expiresAt, timeout });
+        const result = {
+          status: "confirmation_required",
+          requestId,
+          taskId,
+          summary: `Push the current branch and open a pull request: "${title}"`,
+        };
+        this.#host.emit("pull_request.confirmation_required", result);
+        return result;
+      }
+      case "resolve_open_pull_request": {
+        assertOnlyKeys(input, ["requestId", "decision"], name);
+        const requestId = requireString(input["requestId"], "requestId");
+        const decision = requireString(input["decision"], "decision");
+        if (decision !== "approve" && decision !== "reject") {
+          throw new Error("decision must be approve or reject");
+        }
+        const pending = this.#pendingPullRequests.get(requestId);
+        this.#pendingPullRequests.delete(requestId);
+        if (pending) clearTimeout(pending.timeout);
+        if (!pending || pending.expiresAt < Date.now()) {
+          return {
+            status: "rejected",
+            code: "pull_request_confirmation_expired",
+            explanation: "That pull-request request is no longer pending",
+          };
+        }
+        this.#host.emit("pull_request.confirmation_resolved", {
+          requestId,
+          taskId: pending.taskId,
+          decision,
+        });
+        if (decision === "reject") {
+          return {
+            status: "rejected",
+            code: "user_rejected",
+            explanation: "The user rejected opening the pull request",
+          };
+        }
+        const task = this.#resolveTask(pending.taskId);
+        if (!task) {
+          return { status: "rejected", code: "task_not_found", explanation: `Task ${pending.taskId} does not exist` };
+        }
+        if (!this.#host.openPullRequest) {
+          return {
+            status: "rejected",
+            code: "pull_request_unavailable",
+            explanation: "Opening pull requests is unavailable in this Mamachi runtime",
+          };
+        }
+        return this.#host.openPullRequest({
+          repositoryId: task.repositoryId,
+          title: pending.title,
+          body: pending.body,
+        });
+      }
       case "mute_mamachi":
         assertOnlyKeys(input, [], name);
         // Realtime emits "ui.mute" for the daemon/app to disengage the mic;
@@ -978,9 +1098,18 @@ Available for submit_task's repositoryId: ${(this.#host.getAvailableWorkspaces?.
     this.#host.emit("computer.confirmation_cleared", { reason });
   }
 
+  clearPendingPullRequests(reason: string): void {
+    if (this.#pendingPullRequests.size === 0) return;
+    for (const pending of this.#pendingPullRequests.values()) clearTimeout(pending.timeout);
+    this.#pendingPullRequests.clear();
+    this.#host.emit("pull_request.confirmation_cleared", { reason });
+  }
+
   dispose(): void {
     for (const pending of this.#pendingComputerControls.values()) clearTimeout(pending.timeout);
     this.#pendingComputerControls.clear();
+    for (const pending of this.#pendingPullRequests.values()) clearTimeout(pending.timeout);
+    this.#pendingPullRequests.clear();
   }
 
   #computerControlNeedsConfirmation(action: ComputerAction): boolean {

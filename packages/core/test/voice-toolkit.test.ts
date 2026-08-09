@@ -157,6 +157,8 @@ describe("createVoiceToolkit", () => {
       "capture_screen_context",
       "control_computer",
       "resolve_computer_control",
+      "open_pull_request",
+      "resolve_open_pull_request",
       "mute_mamachi",
     ]);
     expect(toolkit.tools().every((tool) => tool.type === "function" && tool.parameters["type"] === "object")).toBe(true);
@@ -430,6 +432,124 @@ describe("createVoiceToolkit", () => {
       decision: "reject",
     });
     toolkit.dispose();
+  });
+
+  test("open_pull_request always requires confirmation and runs the host callback only on approval", async () => {
+    const opened: Array<{ repositoryId: string; title: string; body: string }> = [];
+    const { host, emitted } = makeHost({
+      openPullRequest: async (request) => {
+        opened.push(request);
+        return { status: "opened", url: "https://github.com/acme/widgets/pull/1" };
+      },
+    });
+    const toolkit = createVoiceToolkit(host);
+
+    const pending = asRecord(
+      await toolkit.execute("open_pull_request", { taskId: "task-1", title: "Fix the bug", body: "Details" }),
+    );
+    expect(pending["status"]).toBe("confirmation_required");
+    expect(pending["taskId"]).toBe("task-1");
+    expect(pending["summary"]).toBe('Push the current branch and open a pull request: "Fix the bug"');
+    const requestId = stringField(pending, "requestId");
+    expect(emitted.find((event) => event.type === "pull_request.confirmation_required")?.payload).toEqual(pending);
+    // Nothing runs until the user decides.
+    expect(opened).toEqual([]);
+
+    const result = await toolkit.execute("resolve_open_pull_request", { requestId, decision: "approve" });
+    expect(result).toEqual({ status: "opened", url: "https://github.com/acme/widgets/pull/1" });
+    // The repositoryId comes from resolving the taskId against the snapshot, not from the model.
+    expect(opened).toEqual([{ repositoryId: "/repo", title: "Fix the bug", body: "Details" }]);
+    expect(emitted.find((event) => event.type === "pull_request.confirmation_resolved")?.payload).toEqual({
+      requestId,
+      taskId: "task-1",
+      decision: "approve",
+    });
+    toolkit.dispose();
+  });
+
+  test("rejects a parked pull-request confirmation without ever pushing or opening anything", async () => {
+    const opened: unknown[] = [];
+    const { host } = makeHost({
+      openPullRequest: async (request) => {
+        opened.push(request);
+        return { status: "opened", url: "unused" };
+      },
+    });
+    const toolkit = createVoiceToolkit(host);
+    const requestId = stringField(
+      await toolkit.execute("open_pull_request", { taskId: "task-1", title: "Fix the bug", body: "" }),
+      "requestId",
+    );
+    expect(await toolkit.execute("resolve_open_pull_request", { requestId, decision: "reject" })).toEqual({
+      status: "rejected",
+      code: "user_rejected",
+      explanation: "The user rejected opening the pull request",
+    });
+    expect(opened).toEqual([]);
+
+    // Already resolved -- a second decision finds nothing pending.
+    expect(await toolkit.execute("resolve_open_pull_request", { requestId, decision: "approve" })).toEqual({
+      status: "rejected",
+      code: "pull_request_confirmation_expired",
+      explanation: "That pull-request request is no longer pending",
+    });
+    toolkit.dispose();
+  });
+
+  test("open_pull_request rejects an unknown taskId before ever parking a confirmation", async () => {
+    const { host, emitted } = makeHost({
+      openPullRequest: async () => ({ status: "opened", url: "unused" }),
+    });
+    const toolkit = createVoiceToolkit(host);
+    expect(
+      await toolkit.execute("open_pull_request", { taskId: "no-such-task", title: "x", body: "" }),
+    ).toEqual({ status: "rejected", code: "task_not_found", explanation: "Task no-such-task does not exist" });
+    expect(emitted.some((event) => event.type === "pull_request.confirmation_required")).toBe(false);
+    toolkit.dispose();
+  });
+
+  test("open_pull_request reports unavailable when the host has no openPullRequest callback", async () => {
+    const toolkit = createVoiceToolkit(makeHost().host);
+    expect(
+      await toolkit.execute("open_pull_request", { taskId: "task-1", title: "x", body: "" }),
+    ).toEqual({
+      status: "rejected",
+      code: "pull_request_unavailable",
+      explanation: "Opening pull requests is unavailable in this Mamachi runtime",
+    });
+    toolkit.dispose();
+  });
+
+  test("resolve_open_pull_request on an unknown request id reports expired, not a crash", async () => {
+    const toolkit = createVoiceToolkit(makeHost().host);
+    expect(await toolkit.execute("resolve_open_pull_request", { requestId: "nope", decision: "approve" })).toEqual({
+      status: "rejected",
+      code: "pull_request_confirmation_expired",
+      explanation: "That pull-request request is no longer pending",
+    });
+    toolkit.dispose();
+  });
+
+  test("expires a parked pull-request confirmation after 120 seconds of fake time", async () => {
+    const { host } = makeHost({
+      openPullRequest: async () => ({ status: "opened", url: "unused" }),
+    });
+    const toolkit = createVoiceToolkit(host);
+    try {
+      const requestId = stringField(
+        await toolkit.execute("open_pull_request", { taskId: "task-1", title: "x", body: "" }),
+        "requestId",
+      );
+      setSystemTime(new Date(Date.now() + 121_000));
+      expect(await toolkit.execute("resolve_open_pull_request", { requestId, decision: "approve" })).toEqual({
+        status: "rejected",
+        code: "pull_request_confirmation_expired",
+        explanation: "That pull-request request is no longer pending",
+      });
+    } finally {
+      setSystemTime();
+      toolkit.dispose();
+    }
   });
 
   test("expires a parked confirmation after 120 seconds of fake time", async () => {
