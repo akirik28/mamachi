@@ -9,7 +9,9 @@ final class AppModel: ObservableObject {
     @Published var voiceState: VoiceConnectionState = .disconnected
     @Published var isEngaged = false
     @Published var microphoneLevel = 0.0
-    @Published var activeTaskId: String?
+    @Published var primaryActiveTaskId: String?
+    @Published var activeTaskIds: [String] = []
+    @Published var focusedTaskId: String?
     @Published var queue: [String] = []
     @Published var tasks: [TaskViewState] = []
     @Published var confirmations: [ConfirmationViewState] = []
@@ -70,9 +72,27 @@ final class AppModel: ObservableObject {
     private var errorDismissTask: Task<Void, Never>?
     private var codingAgentMonitorTask: Task<Void, Never>?
 
+    /// The task the compact pill, menu bar, and drawer focus on: the user's
+    /// explicit tap-to-focus choice if it's still active, else the daemon's
+    /// primary (oldest-started) active task.
+    var activeTaskId: String? {
+        if let focusedTaskId, activeTaskIds.contains(focusedTaskId) {
+            return focusedTaskId
+        }
+        return primaryActiveTaskId
+    }
+
     var activeTask: TaskViewState? {
         guard let activeTaskId else { return nil }
         return tasks.first(where: { $0.id == activeTaskId })
+    }
+
+    /// Tap-to-focus: make `taskId` the one shown in the compact pill and
+    /// steered by voice commands that don't name a task explicitly. Purely
+    /// client-local — the daemon has no concept of "focus", only of which
+    /// tasks are active (`activeTaskIds`).
+    func focusTask(_ taskId: String) {
+        focusedTaskId = taskId
     }
 
     var pendingConfirmation: ConfirmationViewState? {
@@ -956,7 +976,11 @@ final class AppModel: ObservableObject {
 
     private func applySnapshot(_ rawSnapshot: [String: Any]?) {
         guard let rawSnapshot else { return }
-        activeTaskId = rawSnapshot["activeTaskId"] as? String
+        primaryActiveTaskId = rawSnapshot["activeTaskId"] as? String
+        activeTaskIds = rawSnapshot["activeTaskIds"] as? [String] ?? []
+        if let focusedTaskId, !activeTaskIds.contains(focusedTaskId) {
+            self.focusedTaskId = nil
+        }
         queue = rawSnapshot["queue"] as? [String] ?? []
         guard let rawTasks = rawSnapshot["tasks"] as? [[String: Any]] else { return }
         let previousByID = Dictionary(uniqueKeysWithValues: tasks.map { ($0.id, $0) })
