@@ -218,10 +218,12 @@ struct OverlayView: View {
             activeTask: model.activeTask,
             tasks: model.tasks,
             queue: model.queue,
+            activeTaskIds: model.activeTaskIds,
             pendingContexts: model.pendingContexts,
             attentionMessage: model.attentionMessage,
             hasPendingApproval: model.pendingConfirmation != nil,
             onControlTask: model.controlActiveTask,
+            onFocusTask: model.focusTask,
             onReorderQueue: { taskId, offset in
                 model.moveQueuedTask(taskId, up: offset < 0)
             },

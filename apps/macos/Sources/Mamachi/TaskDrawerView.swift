@@ -9,10 +9,12 @@ struct TaskDrawerView: View {
     let activeTask: TaskViewState?
     let tasks: [TaskViewState]
     let queue: [String]
+    let activeTaskIds: [String]
     let pendingContexts: [CapturedContextViewState]
     let attentionMessage: String?
     let hasPendingApproval: Bool
     let onControlTask: (String) -> Void
+    var onFocusTask: ((String) -> Void)?
     var onReorderQueue: ((_ taskId: String, _ offset: Int) -> Void)?
     var onRemoveQueued: ((_ taskId: String) -> Void)?
     var onRemoveContext: ((CapturedContextViewState) -> Void)?
@@ -22,6 +24,13 @@ struct TaskDrawerView: View {
 
     private var historyTasks: [TaskViewState] {
         tasks.filter { $0.isTerminal && $0.id != activeTask?.id }.reversed()
+    }
+
+    /// Tasks the daemon reports as active but which aren't the one currently
+    /// focused — invisible before multi-agent, since activeTaskIds could
+    /// only ever contain the one task rendered by activeTaskCard.
+    private var otherRunningTasks: [TaskViewState] {
+        tasks.filter { activeTaskIds.contains($0.id) && $0.id != activeTask?.id }
     }
 
     var body: some View {
@@ -37,6 +46,9 @@ struct TaskDrawerView: View {
                 }
                 if !queue.isEmpty {
                     queueSection
+                }
+                if !otherRunningTasks.isEmpty {
+                    otherRunningSection
                 }
                 if let task = focusTask {
                     factSections(task)
@@ -282,6 +294,50 @@ struct TaskDrawerView: View {
 
     private func objective(for taskId: String) -> String {
         tasks.first(where: { $0.id == taskId })?.objective ?? "Task \(taskId.prefix(8))"
+    }
+
+    // MARK: - Other running tasks
+
+    private var otherRunningSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "bolt.fill")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                SectionLabel("Also running")
+                Spacer()
+            }
+            ForEach(otherRunningTasks) { task in
+                Button {
+                    onFocusTask?(task.id)
+                } label: {
+                    HStack(alignment: .top, spacing: 7) {
+                        Circle()
+                            .fill(Theme.statusColor(task.state))
+                            .frame(width: 6, height: 6)
+                            .padding(.top, 4)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(task.objective)
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            Text(task.stateLabel)
+                                .font(.system(size: 9))
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                    }
+                }
+                .buttonStyle(.plain)
+                if task.id != otherRunningTasks.last?.id {
+                    Divider().opacity(0.4)
+                }
+            }
+        }
+        .padding(12)
+        .glassCard()
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Other running tasks, \(otherRunningTasks.count)")
     }
 
     // MARK: - Fact sections
