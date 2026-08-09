@@ -75,7 +75,7 @@ export interface QuestionRecord {
   runId: string;
   question: string;
   state: "open" | "resolved";
-  resolution: "answered" | "superseded" | null;
+  resolution: "answered" | "superseded" | "abandoned" | null;
   answer: string | null;
   askedAt: string;
   resolvedAt: string | null;
@@ -162,6 +162,33 @@ function requireTaskId(event: DomainEvent): string {
 function removeFromQueue(state: ControllerState, taskId: string): void {
   const index = state.queue.indexOf(taskId);
   if (index !== -1) state.queue.splice(index, 1);
+}
+
+/**
+ * A task can reach a terminal state (completed, failed, or cancelled) while
+ * it still has an open question or a pending confirmation -- most directly
+ * via `task.cancel`, which (unlike completion/failure) is accepted from any
+ * non-terminal state, including `awaiting_user`. Without this cleanup the
+ * question/confirmation record would keep pointing at a task that can never
+ * resolve it, and for questions specifically `assertStateInvariants` treats
+ * that as corruption (an open question implies `awaiting_user`) and throws.
+ * Mirrors the analogous cleanup `task.specRevised` already does for open
+ * questions it supersedes, below.
+ */
+function abandonOpenWorkOn(state: ControllerState, taskId: string, at: string): void {
+  for (const question of state.questions.values()) {
+    if (question.taskId === taskId && question.state === "open") {
+      question.state = "resolved";
+      question.resolution = "abandoned";
+      question.resolvedAt = at;
+    }
+  }
+  for (const confirmation of state.confirmations.values()) {
+    if (confirmation.taskId === taskId && confirmation.state === "pending") {
+      confirmation.state = "rejected";
+      confirmation.resolvedAt = at;
+    }
+  }
 }
 
 export function applyEvent(state: ControllerState, event: DomainEvent): void {
@@ -360,6 +387,7 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       task.updatedAt = event.at;
       task.terminalSummary = event.payload.summary;
       task.pendingQuestion = null;
+      abandonOpenWorkOn(state, taskId, event.at);
       removeFromQueue(state, taskId);
       state.activeTaskIds = state.activeTaskIds.filter((id) => id !== taskId);
       break;
@@ -375,6 +403,7 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       task.updatedAt = event.at;
       task.terminalSummary = event.payload.error;
       task.pendingQuestion = null;
+      abandonOpenWorkOn(state, taskId, event.at);
       removeFromQueue(state, taskId);
       state.activeTaskIds = state.activeTaskIds.filter((id) => id !== taskId);
       break;
@@ -392,6 +421,7 @@ export function applyEvent(state: ControllerState, event: DomainEvent): void {
       task.updatedAt = event.at;
       task.terminalSummary = event.payload.reason;
       task.pendingQuestion = null;
+      abandonOpenWorkOn(state, taskId, event.at);
       removeFromQueue(state, taskId);
       state.activeTaskIds = state.activeTaskIds.filter((id) => id !== taskId);
       break;

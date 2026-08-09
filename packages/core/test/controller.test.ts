@@ -1331,4 +1331,81 @@ describe("TaskController", () => {
       rmSync(directory, { recursive: true, force: true });
     }
   });
+
+  // Regression test for a real bug found by the randomized invariant stress
+  // test (controller-invariants-stress.test.ts): task.cancel is correctly
+  // accepted from awaiting_user (unlike completion/failure, which the
+  // controller already refuses whenever a question is open), but the
+  // task.cancelled reducer case didn't used to resolve that open question --
+  // leaving an orphaned "open" question attached to a cancelled task, which
+  // assertStateInvariants correctly rejects as corruption.
+  test("cancelling a task with an open question resolves the question as abandoned instead of leaving it orphaned", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const taskId = submit(controller);
+      const questionId = Bun.randomUUIDv7();
+      expect(controller.awaitUserInput(questionId, taskId, "Which target?").status).toBe("accepted");
+      expect(controller.snapshot().tasks[0]?.state).toBe("awaiting_user");
+
+      const cancelled = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.cancel",
+        actor: "ui",
+        expectedRevision: 1,
+        payload: { taskId, reason: "No longer needed" },
+      });
+      expect(cancelled.status).toBe("accepted");
+
+      const snapshot = controller.snapshot();
+      expect(snapshot.tasks[0]?.state).toBe("cancelled");
+      expect(snapshot.questions?.find((question) => question.id === questionId)).toMatchObject({
+        state: "resolved",
+        resolution: "abandoned",
+        answer: null,
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  test("cancelling a task with a pending confirmation resolves it as rejected instead of leaving it orphaned", () => {
+    const store = new EventStore();
+    try {
+      const controller = new TaskController(store);
+      const taskId = submit(controller);
+      const proposed = controller.authorizeToolCall(Bun.randomUUIDv7(), taskId, "bash", {
+        command: "git push origin main",
+      });
+      if (proposed.status !== "confirmation_required") throw new Error("Expected the risky action to require approval");
+      expect(controller.snapshot().tasks[0]?.state).toBe("awaiting_user");
+
+      const cancelled = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "task.cancel",
+        actor: "ui",
+        expectedRevision: 1,
+        payload: { taskId, reason: "No longer needed" },
+      });
+      expect(cancelled.status).toBe("accepted");
+
+      const confirmation = controller.snapshot().confirmations.find((candidate) => candidate.id === proposed.confirmationId);
+      expect(confirmation?.state).toBe("rejected");
+      expect(confirmation?.resolvedAt).not.toBeNull();
+
+      // A belated attempt to resolve it is cleanly rejected, not silently accepted
+      // (and does not resurrect the cancelled task).
+      const belated = controller.handle({
+        id: Bun.randomUUIDv7(),
+        type: "approval.resolve",
+        actor: "ui",
+        expectedRevision: controller.snapshot().tasks[0]?.revision ?? 1,
+        payload: { confirmationId: proposed.confirmationId, decision: "approve" },
+      });
+      expect(belated).toMatchObject({ status: "rejected", code: "stale_confirmation" });
+      expect(controller.snapshot().tasks[0]?.state).toBe("cancelled");
+    } finally {
+      store.close();
+    }
+  });
 });

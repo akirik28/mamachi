@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import type { TaskSpec } from "@mamachi/protocol";
+import type { DomainEvent, TaskSpec } from "@mamachi/protocol";
 import {
+  applyEvent,
   assertStateInvariants,
   createEmptyState,
   MAX_CONCURRENT_TASKS,
@@ -253,5 +254,76 @@ describe("assertStateInvariants", () => {
     state.questions.set("q1", makeQuestion("q1", "awaiting"));
     state.confirmations.set("c1", makeConfirmation("c1", "awaiting"));
     expect(() => assertStateInvariants(state)).not.toThrow();
+  });
+});
+
+// Regression coverage for a real bug the randomized stress test in
+// controller-invariants-stress.test.ts found: `task.cancel` is (correctly)
+// accepted from `awaiting_user`, unlike completion/failure, which the
+// controller's own guards already refuse whenever a question is open (an
+// open question always implies `activeRunId === null`, and completion/
+// failure require an active run). Before the fix, none of the three terminal
+// reducer cases cleared a task's open question or pending confirmation, so
+// cancelling an `awaiting_user` task left an orphaned "open" question
+// pointing at a now-cancelled task -- which `assertStateInvariants` correctly
+// treats as corruption (an open question must imply `awaiting_user`) and
+// throws. `controller.test.ts` covers the realistically-reachable cancel
+// case end-to-end through TaskController; this covers all three terminal
+// cases directly against the reducer, including the two (`task.completed`/
+// `task.failed`) that are only unreachable today because of guards one layer
+// up in controller.ts -- a future change to those guards should not silently
+// reintroduce this bug at the reducer level.
+describe("applyEvent: terminal transitions abandon open work instead of orphaning it", () => {
+  function terminalEvent(type: DomainEvent["type"], taskId: string, seq: number, payload: Record<string, unknown>): DomainEvent {
+    return {
+      version: 1,
+      id: `evt-${seq}`,
+      at,
+      type,
+      actor: "controller",
+      projectId: "repo_a",
+      taskId,
+      seq,
+      correlationId: "corr",
+      causedBy: "corr",
+      payload,
+    } as unknown as DomainEvent;
+  }
+
+  function stateWithOpenQuestionAndPendingConfirmation(): ControllerState {
+    const state = createEmptyState();
+    state.tasks.set("t1", makeTask("t1", "repo_a", "awaiting_user", { activeRunId: null }));
+    state.activeTaskIds = ["t1"];
+    state.runs.set("run-1", makeRun("run-1", "t1", "running"));
+    state.questions.set("q1", makeQuestion("q1", "t1", { runId: "run-1" }));
+    state.confirmations.set("c1", makeConfirmation("c1", "t1"));
+    return state;
+  }
+
+  test("task.completed abandons an open question and rejects a pending confirmation rather than orphaning them", () => {
+    const state = stateWithOpenQuestionAndPendingConfirmation();
+    expect(() =>
+      applyEvent(state, terminalEvent("task.completed", "t1", 1, { runId: "run-1", summary: "done", evidenceIds: [] })),
+    ).not.toThrow();
+    expect(state.questions.get("q1")).toMatchObject({ state: "resolved", resolution: "abandoned" });
+    expect(state.confirmations.get("c1")?.state).toBe("rejected");
+  });
+
+  test("task.failed abandons an open question and rejects a pending confirmation rather than orphaning them", () => {
+    const state = stateWithOpenQuestionAndPendingConfirmation();
+    expect(() =>
+      applyEvent(state, terminalEvent("task.failed", "t1", 1, { runId: "run-1", error: "boom" })),
+    ).not.toThrow();
+    expect(state.questions.get("q1")).toMatchObject({ state: "resolved", resolution: "abandoned" });
+    expect(state.confirmations.get("c1")?.state).toBe("rejected");
+  });
+
+  test("task.cancelled abandons an open question and rejects a pending confirmation rather than orphaning them", () => {
+    const state = stateWithOpenQuestionAndPendingConfirmation();
+    expect(() =>
+      applyEvent(state, terminalEvent("task.cancelled", "t1", 1, { reason: "no longer needed" })),
+    ).not.toThrow();
+    expect(state.questions.get("q1")).toMatchObject({ state: "resolved", resolution: "abandoned" });
+    expect(state.confirmations.get("c1")?.state).toBe("rejected");
   });
 });
