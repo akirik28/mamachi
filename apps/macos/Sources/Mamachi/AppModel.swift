@@ -87,10 +87,23 @@ final class AppModel: ObservableObject {
         return tasks.first(where: { $0.id == activeTaskId })
     }
 
-    /// Tap-to-focus: make `taskId` the one shown in the compact pill and
-    /// steered by voice commands that don't name a task explicitly. Purely
-    /// client-local — the daemon has no concept of "focus", only of which
-    /// tasks are active (`activeTaskIds`).
+    /// Tap-to-focus: make `taskId` the one shown in the compact pill, the one
+    /// `controlActiveTask` acts on, and the one highlighted in the drawer.
+    /// Purely client-local — the daemon has no concept of "focus", only of
+    /// which tasks are active (`activeTaskIds`).
+    ///
+    /// This does NOT reach the voice model: an ambiguous voice command (one
+    /// that doesn't name a task explicitly) is resolved entirely server-side,
+    /// against the daemon's own primary active task, not against whatever is
+    /// focused here (`packages/core/src/voice-toolkit.ts`, `#resolveTask`,
+    /// which falls back to `snapshot.activeTaskId` — the oldest-started
+    /// active task — and never sees `focusedTaskId`). Concretely: if the user
+    /// taps to focus a second running task and then says "pause this" with
+    /// no task named, the daemon still targets the oldest task, not the one
+    /// just focused. In practice this mostly affects `get_task_status`, the
+    /// only mutating-or-not voice tool whose `taskId` argument is nullable;
+    /// every voice tool that mutates a specific task's state requires an
+    /// explicit, non-null `taskId` in its schema.
     func focusTask(_ taskId: String) {
         focusedTaskId = taskId
     }
