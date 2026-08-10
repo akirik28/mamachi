@@ -16,6 +16,7 @@ import {
   type RuntimeSettings,
 } from "./model-router.ts";
 import { MacComputerController } from "./computer-control.ts";
+import { openPullRequest } from "./pull-request.ts";
 import { OmpObserverBackend, PassiveObserver } from "./observer.ts";
 import { VoiceBriefStore } from "./voice-brief-store.ts";
 import { resolveEncryptionKey } from "./encryption-key.ts";
@@ -204,7 +205,7 @@ const daemon = new MamachiIpcServer({
 
 const voiceCallbacks = {
   getWorkspace: () => daemon.workspace,
-  getAvailableWorkspaces: () => [daemon.workspace],
+  getAvailableWorkspaces: () => daemon.workspaces,
   getCodingProfiles: () => ["auto", "primary", "fast"],
   getComputerCapabilities: () => runtimeSettings.computerCapabilities,
   getComputerConfirmationMode: () => runtimeSettings.computerConfirmationMode,
@@ -220,6 +221,7 @@ const voiceCallbacks = {
     daemon.rememberFact(scope, projectId, fact),
   forgetFact: (memoryId: string) => daemon.forgetFact(memoryId),
   controlComputer: (request: ComputerControlRequest) => computerController.control(request),
+  openPullRequest: (request: { repositoryId: string; title: string; body: string }) => openPullRequest(request),
   emit: (type: string, payload: unknown) => daemon.emit(type, payload),
   captureScreenContext: async (path: string, summary: string) =>
     daemon.captureScreenshotContext(path, summary),

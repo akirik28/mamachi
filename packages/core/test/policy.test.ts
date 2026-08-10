@@ -28,6 +28,18 @@ describe("assessToolCall", () => {
     expect(publication.effectFingerprint).not.toBe(outsideWrite.effectFingerprint);
   });
 
+  test("requires approval for gh pr create the same as any other publication command", () => {
+    // Defense in depth: the coding agent has no path to gh/git credentials
+    // (sensitiveChildEnvironmentKeys strips them before spawn) and its own
+    // prompt unconditionally forbids publishing, so this should never
+    // actually be reached from a running task -- but if a future escalation
+    // ever did let a coding agent run `gh pr create` directly, it must still
+    // require the same explicit approval as `git push` or `gh release
+    // create`, not fall through to "automatic".
+    const assessment = assessToolCall("bash", { command: "gh pr create --title x --body y" }, repository);
+    expect(assessment).toMatchObject({ tier: "visual_approval", category: "external_publication" });
+  });
+
   test("rejects commands that enumerate the daemon environment", () => {
     expect(assessToolCall("bash", { command: "env" }, repository))
       .toMatchObject({ tier: "reject", category: "credential_access" });

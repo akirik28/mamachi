@@ -153,6 +153,8 @@ describe("RealtimeBridge", () => {
       "capture_screen_context",
       "control_computer",
       "resolve_computer_control",
+      "open_pull_request",
+      "resolve_open_pull_request",
       "mute_mamachi",
     ]);
     const computerTool = toolList.find((tool) => tool["name"] === "control_computer");

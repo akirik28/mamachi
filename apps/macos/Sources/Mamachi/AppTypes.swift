@@ -22,6 +22,9 @@ struct TaskViewState: Identifiable, Equatable {
     var recentActivity: String?
     // Display-only facts populated as richer domain events land. Defaulted so
     // existing initializers stay source-compatible.
+    /// Which repository this task runs in -- shown so concurrent task cards
+    /// (multiple repos can be active at once) are distinguishable.
+    var repositoryId: String = ""
     var phase: String? = nil
     var currentStep: String? = nil
     /// Grounded progress in percent (0–100) from the daemon fact projector.
@@ -40,6 +43,12 @@ struct TaskViewState: Identifiable, Equatable {
 
     var isTerminal: Bool {
         ["completed", "failed", "cancelled"].contains(state)
+    }
+
+    /// Short, human-readable repository name for distinguishing concurrent
+    /// task cards -- the folder name, not the full path.
+    var repositoryLabel: String {
+        repositoryId.isEmpty ? "" : URL(fileURLWithPath: repositoryId).lastPathComponent
     }
 
     var stateLabel: String {

@@ -48,4 +48,15 @@ final class AppModelConcurrentTasksTests: XCTestCase {
 
         XCTAssertEqual(model.activeTaskId, "a", "focus must not point at a task that's no longer active")
     }
+
+    func testRepositoryLabelShowsTheFolderNameNotTheFullPath() {
+        var task = TaskViewState(id: "a", state: "running", revision: 1, objective: "A", terminalSummary: nil, recentActivity: nil)
+        task.repositoryId = "/Users/dev/code/widgets-backend"
+        XCTAssertEqual(task.repositoryLabel, "widgets-backend")
+    }
+
+    func testRepositoryLabelIsEmptyWhenNoRepositoryIsSet() {
+        let task = TaskViewState(id: "a", state: "running", revision: 1, objective: "A", terminalSummary: nil, recentActivity: nil)
+        XCTAssertEqual(task.repositoryLabel, "")
+    }
 }

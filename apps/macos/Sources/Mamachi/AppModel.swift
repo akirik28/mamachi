@@ -863,6 +863,12 @@ final class AppModel: ObservableObject {
              "computer.confirmation_cleared",
              "computer.confirmation_expired":
             attentionMessage = nil
+        case "pull_request.confirmation_required":
+            attentionMessage = payload["summary"] as? String ?? "Opening a pull request needs confirmation."
+        case "pull_request.confirmation_resolved",
+             "pull_request.confirmation_cleared",
+             "pull_request.confirmation_expired":
+            attentionMessage = nil
         case "ui.mute":
             muteMicrophone()
         case "voice.interrupt":
@@ -1015,6 +1021,7 @@ final class AppModel: ObservableObject {
                 terminalSummary: rawTask["terminalSummary"] as? String,
                 recentActivity: previous?.recentActivity
             )
+            task.repositoryId = rawTask["repositoryId"] as? String ?? ""
             task.pendingQuestion = rawTask["pendingQuestion"] as? String
             task.createdAt = Self.parseDate(rawTask["createdAt"])
             task.specHistory = (rawTask["specHistory"] as? [[String: Any]] ?? []).compactMap { entry in
