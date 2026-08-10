@@ -467,6 +467,46 @@ describe("createVoiceToolkit", () => {
     toolkit.dispose();
   });
 
+  test("a second open_pull_request supersedes the first parked one, mirroring control_computer's exact rule", async () => {
+    const opened: unknown[] = [];
+    const { host, emitted } = makeHost({
+      getSnapshot: () => makeSnapshot([makeTask({ id: "task-1" }), makeTask({ id: "task-2" })]),
+      openPullRequest: async (request) => {
+        opened.push(request);
+        return { status: "opened", url: "unused" };
+      },
+    });
+    const toolkit = createVoiceToolkit(host);
+
+    const firstId = stringField(
+      await toolkit.execute("open_pull_request", { taskId: "task-1", title: "First", body: "" }),
+      "requestId",
+    );
+    const secondId = stringField(
+      await toolkit.execute("open_pull_request", { taskId: "task-2", title: "Second", body: "" }),
+      "requestId",
+    );
+    expect(emitted.find((event) => event.type === "pull_request.confirmation_cleared")?.payload).toEqual({
+      reason: "superseded",
+    });
+
+    // The superseded first request can no longer be approved -- only one
+    // pull-request confirmation is ever pending at a time, same as
+    // control_computer's own rule for computer-action confirmations.
+    expect(await toolkit.execute("resolve_open_pull_request", { requestId: firstId, decision: "approve" })).toEqual({
+      status: "rejected",
+      code: "pull_request_confirmation_expired",
+      explanation: "That pull-request request is no longer pending",
+    });
+    expect(opened).toEqual([]);
+
+    expect(await toolkit.execute("resolve_open_pull_request", { requestId: secondId, decision: "approve" })).toEqual({
+      status: "opened",
+      url: "unused",
+    });
+    toolkit.dispose();
+  });
+
   test("rejects a parked pull-request confirmation without ever pushing or opening anything", async () => {
     const opened: unknown[] = [];
     const { host } = makeHost({
